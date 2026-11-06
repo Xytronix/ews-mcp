@@ -1,9 +1,11 @@
 """Email operation tools for EWS MCP Server."""
 
+import heapq
+import itertools
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from exchangelib import Message, Mailbox, FileAttachment, ItemAttachment, HTMLBody, Body, Folder, ExtendedProperty
 from exchangelib.errors import ErrorTimeoutExpired
@@ -18,7 +20,7 @@ class FlagStatus(ExtendedProperty):
 
 
 # Register the flag property on Message class. ``outbound_tracking_id`` is
-# registered in ``src.utils`` alongside the header constant.
+# registered in ``src.utils`` alongside the tracking header setting.
 Message.register('flag_status_value', FlagStatus)
 
 # Mapping from string flag_status to integer values
@@ -418,6 +420,85 @@ def _paginate_query_matching(
     return outcome
 
 
+def _with_fields(only_fields: tuple, *needed: str) -> tuple:
+    """Add DB fields the tool itself reads to a ``.only()`` projection.
+
+    An empty projection already fetches every field, so it stays empty.
+    """
+    if not only_fields:
+        return only_fields
+    extra = tuple(f for f in dict.fromkeys(needed) if f not in only_fields)
+    return tuple(only_fields) + extra
+
+
+def _missing_last(value: Any) -> tuple:
+    # An item without the value sorts as the smallest (last when newest
+    # first) and None is never compared with a real value.
+    return (0,) if value is None else (1, value)
+
+
+def _mailbox_sort_value(mailbox: Any) -> Optional[str]:
+    # A mailbox sorts by its display name, or its address when it has none.
+    text = safe_get(mailbox, "name") or safe_get(mailbox, "email_address")
+    return text.casefold() if text else None
+
+
+_IMPORTANCE_RANK = {"Low": 0, "Normal": 1, "High": 2}
+
+# Local stand-ins for the server sort on each orderable exchangelib field.
+_MERGE_SORT_KEYS: Dict[str, Any] = {
+    "datetime_received": lambda item: _missing_last(safe_get(item, "datetime_received")),
+    "datetime_sent": lambda item: _missing_last(safe_get(item, "datetime_sent")),
+    "subject": lambda item: (safe_get(item, "subject") or "").casefold(),
+    "importance": lambda item: _IMPORTANCE_RANK.get(safe_get(item, "importance"), 1),
+    "sender": lambda item: _missing_last(_mailbox_sort_value(safe_get(item, "sender"))),
+}
+
+
+def _folder_fetch_window(folder_count: int, offset: int, limit: int) -> Tuple[int, int]:
+    """Return the ``(offset, max_results)`` to request from every folder.
+
+    A single folder pages on the server. Across several, any one folder may
+    supply anywhere from none to all of the first ``offset + limit`` merged
+    items, so each must hand over that many. The extra item tells whether
+    another page follows.
+    """
+    if folder_count <= 1:
+        return offset, limit + 1
+    return 0, offset + limit + 1
+
+
+def _merge_folder_page(
+    per_folder: List[Tuple[str, List[Any]]],
+    *,
+    sort_field: str,
+    descending: bool,
+    skip: int,
+    limit: int,
+) -> Tuple[List[Tuple[str, Any]], bool]:
+    """Merge each folder's server-ordered window into one page.
+
+    ``per_folder`` holds ``(folder_name, items)`` in server order, fetched
+    with :func:`_folder_fetch_window`; ``skip`` drops the merged items that
+    precede the page. ``heapq.merge`` only compares folder heads, so every
+    folder keeps the server's order even where the local key collates
+    differently, and the first ``n`` merged items depend only on each
+    folder's first ``n``. Consecutive pages therefore cut one sequence and
+    each item appears on exactly one of them. Ties go to the earlier folder.
+
+    Returns the page as ``(folder_name, item)`` pairs and whether more
+    items follow it.
+    """
+    item_key = _MERGE_SORT_KEYS.get(sort_field, lambda item: 0)
+    merged = heapq.merge(
+        *([(name, item) for item in items] for name, items in per_folder),
+        key=lambda pair: item_key(pair[1]),
+        reverse=descending,
+    )
+    window = list(itertools.islice(merged, skip + limit + 1))
+    return window[skip:skip + limit], len(window) > skip + limit
+
+
 def _build_list_item(
     email: Any,
     *,
@@ -589,6 +670,56 @@ def add_reply_prefix(subject: str) -> str:
     if not stripped:
         return "RE:"
     return f"RE: {stripped}"
+
+
+def reply_recipients(
+    sender: str,
+    original_to: List[str],
+    original_cc: List[str],
+    own_address: Optional[str],
+    *,
+    reply_all: bool,
+    extra_cc: Optional[List[str]] = None,
+    extra_bcc: Optional[List[str]] = None,
+) -> Tuple[List[str], List[str], List[str]]:
+    """Return the ``(to, cc, bcc)`` addresses of a reply.
+
+    Reply-all keeps the original roles, as Outlook does: the sender and the
+    original To go in To, the original Cc stays in Cc, and our own address is
+    dropped from both. A plain reply goes to the sender only. ``extra_cc`` and
+    ``extra_bcc`` are the caller's additions and are kept even when they name
+    us, because the caller asked for them explicitly.
+
+    Addresses compare case-insensitively and each one lands only in the first
+    field that claims it (To, then Cc, then Bcc), so nobody is listed twice.
+    """
+    own = (own_address or "").strip().lower()
+    seen: set = set()
+
+    def take(addresses, target: List[str], *, keep_own: bool = False) -> None:
+        for address in addresses or ():
+            address = (address or "").strip()
+            key = address.lower()
+            if not address or key in seen or (key == own and not keep_own):
+                continue
+            seen.add(key)
+            target.append(address)
+
+    to: List[str] = []
+    cc: List[str] = []
+    bcc: List[str] = []
+    if reply_all:
+        take([sender, *original_to], to)
+        take(original_cc, cc)
+        if not to and not cc:
+            # A note to self leaves nobody else to answer; reply to its
+            # sender as a plain reply would rather than to no one.
+            take([sender], to, keep_own=True)
+    else:
+        take([sender], to, keep_own=True)
+    take(extra_cc, cc, keep_own=True)
+    take(extra_bcc, bcc, keep_own=True)
+    return to, cc, bcc
 
 
 def clean_original_body_for_signature(original_body_html: str) -> str:
@@ -1252,8 +1383,10 @@ class SendEmailTool(BaseTool):
 
             # Send the message (attachments are included automatically)
             message.send()
+            # tracking_id is None when outbound tracking is turned off.
+            accepted = f"message {tracking_id}" if tracking_id else "message"
             self.logger.info(
-                f"Mail server accepted message {tracking_id} to "
+                f"Mail server accepted {accepted} to "
                 f"{', '.join(request.to)} with {attachment_count} attachment(s)"
             )
 
@@ -1529,7 +1662,7 @@ class SearchEmailsTool(BaseTool):
                     "categories": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Filter by email categories (advanced mode)"
+                        "description": "Filter by email categories; a message must carry every listed category (all modes)"
                     },
                     "search_scope": {
                         "type": "array",
@@ -1590,9 +1723,11 @@ class SearchEmailsTool(BaseTool):
 
     # Anything in this set gates off the "auto-add last 30 days" default
     # when neither start_date nor end_date was supplied (see _search_quick).
+    # A supplied boolean counts even when False: is_flagged=False is a filter.
     _QUICK_FILTER_KEYS: tuple = (
         "subject_contains", "from_address", "sender", "to_address", "recipient",
-        "body_contains", "query", "has_attachments", "is_read", "importance",
+        "body_contains", "query", "has_attachments", "is_read", "is_flagged",
+        "importance", "categories",
     )
 
     def _validate_kwargs(self, kwargs: Dict[str, Any]) -> None:
@@ -1660,13 +1795,10 @@ class SearchEmailsTool(BaseTool):
             # through the default and get replaced by "last 30 days",
             # silently discarding the caller's intent.
             if not kwargs.get("start_date") and not kwargs.get("end_date"):
-                has_filters = any([
-                    subject_contains, from_address, to_address,
-                    body_contains, free_text,
-                    kwargs.get("has_attachments") is not None,
-                    kwargs.get("is_read") is not None,
-                    kwargs.get("importance"),
-                ])
+                has_filters = any(
+                    kwargs.get(key) not in (None, "", [])
+                    for key in self._QUICK_FILTER_KEYS
+                )
 
                 if not has_filters:
                     from datetime import timedelta
@@ -1723,6 +1855,9 @@ class SearchEmailsTool(BaseTool):
                     query = query.exclude(flag_status_value=2)
             if kwargs.get("importance"):
                 query = query.filter(importance=kwargs["importance"])
+            if kwargs.get("categories"):
+                # Same restriction as advanced mode: every listed category.
+                query = query.filter(categories__contains=kwargs["categories"])
             if kwargs.get("start_date"):
                 start = parse_datetime_tz_aware(kwargs["start_date"])
                 query = query.filter(datetime_received__gte=start)
@@ -1831,6 +1966,9 @@ class SearchEmailsTool(BaseTool):
         max_results = kwargs.get("max_results", 250)
         sort_by = kwargs.get("sort_by", "datetime_received")
         sort_order = kwargs.get("sort_order", "descending")
+        # ``from`` is a public name, not an exchangelib field. Results and the
+        # from_address filter read it from ``sender``, so sort on that too.
+        sort_field = _DB_FIELDS_BY_PUBLIC.get(sort_by, (sort_by,))[0]
         text_matcher = _subject_search_matcher(kwargs.get("subject_contains"))
 
         try:
@@ -1915,14 +2053,19 @@ class SearchEmailsTool(BaseTool):
                 only_fields,
                 kwargs.get("subject_contains"),
             )
+            if adv_sender_needle:
+                only_fields = _with_fields(only_fields, "sender")
+            # The merge below reads the sort value from each item.
+            if sort_field in _MERGE_SORT_KEYS:
+                only_fields = _with_fields(only_fields, sort_field)
 
-            all_results: List[Dict[str, Any]] = []
+            per_folder: List[Tuple[str, List[Any]]] = []
             per_folder_errors: List[Dict[str, Any]] = []
             total_available_sum: Optional[int] = 0
             some_total_unknown = False
 
-            per_folder_budget = (
-                max_results // len(folders) if len(folders) > 1 else max_results
+            fetch_offset, fetch_limit = _folder_fetch_window(
+                len(folders), offset, max_results,
             )
             start_time = datetime.now()
 
@@ -1933,8 +2076,6 @@ class SearchEmailsTool(BaseTool):
                         folder.filter(combined_filter)
                         if combined_filter is not None else folder.all()
                     )
-                    if only_fields and adv_sender_needle and "sender" not in only_fields:
-                        only_fields = tuple(only_fields) + ("sender",)
                     if only_fields:
                         try:
                             query = query.only(*only_fields)
@@ -1946,10 +2087,10 @@ class SearchEmailsTool(BaseTool):
                                 "query.only(%s) rejected on %s: %s",
                                 only_fields, folder_name, only_exc,
                             )
-                    sort_field = sort_by
-                    if sort_order == "descending" and not sort_field.startswith('-'):
-                        sort_field = f"-{sort_field}"
-                    query = query.order_by(sort_field)
+                    order = sort_field
+                    if sort_order == "descending" and not order.startswith('-'):
+                        order = f"-{order}"
+                    query = query.order_by(order)
                 except Exception as setup_exc:
                     # Filter/sort setup itself failed — classify and carry.
                     per_folder_errors.append({
@@ -1967,8 +2108,8 @@ class SearchEmailsTool(BaseTool):
                 if text_matcher is None:
                     outcome = _paginate_query(
                         query,
-                        max_results=per_folder_budget,
-                        offset=offset,
+                        max_results=fetch_limit,
+                        offset=fetch_offset,
                         chunk_size=50,
                         logger=self.logger,
                         folder_label=folder_name,
@@ -1977,8 +2118,8 @@ class SearchEmailsTool(BaseTool):
                     outcome = _paginate_query_matching(
                         query,
                         matcher=text_matcher,
-                        max_results=per_folder_budget,
-                        offset=offset,
+                        max_results=fetch_limit,
+                        offset=fetch_offset,
                         chunk_size=50,
                         logger=self.logger,
                         folder_label=folder_name,
@@ -1987,7 +2128,7 @@ class SearchEmailsTool(BaseTool):
                     self.logger, "FindItem",
                     result_count=len(outcome.items),
                     total_available=outcome.total_available,
-                    page_offset=offset,
+                    page_offset=fetch_offset,
                     folder=folder_name,
                     outcome="ok" if outcome.error_code is None else outcome.error_code,
                     error_type=(
@@ -2009,19 +2150,19 @@ class SearchEmailsTool(BaseTool):
                         "error_message": outcome.error_message,
                     })
 
-                for email in outcome.items:
-                    all_results.append(
-                        _build_list_item(email, fields=fields, folder_name=folder_name)
-                    )
+                per_folder.append((folder_name, outcome.items))
 
-            if len(folders) > 1:
-                reverse = (sort_order == "descending")
-                if sort_by == "datetime_received":
-                    all_results.sort(key=lambda x: x.get("received_time") or "", reverse=reverse)
-                elif sort_by == "subject":
-                    all_results.sort(key=lambda x: x.get("subject") or "", reverse=reverse)
-
-            all_results = all_results[:max_results]
+            page, has_more = _merge_folder_page(
+                per_folder,
+                sort_field=sort_field,
+                descending=sort_order == "descending",
+                skip=offset - fetch_offset,
+                limit=max_results,
+            )
+            all_results: List[Dict[str, Any]] = [
+                _build_list_item(email, fields=fields, folder_name=name)
+                for name, email in page
+            ]
 
             # total_available is a sum across folders when every folder
             # reported a count; None if at least one was unknown.
@@ -2040,7 +2181,7 @@ class SearchEmailsTool(BaseTool):
                 "folders_searched": search_scope,
                 "mailbox": mailbox,
             }
-            if total_available is not None and len(all_results) + offset < total_available:
+            if has_more:
                 response["next_offset"] = offset + len(all_results)
             if meta:
                 response["meta"] = meta
@@ -2117,10 +2258,39 @@ class SearchEmailsTool(BaseTool):
 
             only_fields = _db_fields_for(fields)
             offset = max(0, int(kwargs.get("offset", 0)))
-            all_results: List[Dict[str, Any]] = []
+            categories = kwargs.get("categories")
+            phrase_matcher = None
+            if exact_phrase:
+                # Exact-phrase check stays client-side: the EWS ``__contains``
+                # filter already narrowed us. Verifying during the scan, not
+                # after it, keeps pages and totals counted in real matches.
+                def phrase_matcher(item):
+                    item_text = ""
+                    if "subject" in search_in:
+                        item_text += (safe_get(item, "subject", "") or "").lower() + " "
+                    if "body" in search_in:
+                        item_text += (safe_get(item, "text_body", "") or "").lower() + " "
+                    if search_query in item_text:
+                        return True
+                    if "attachments" in search_in and hasattr(item, "attachments") and item.attachments:
+                        for att in item.attachments:
+                            if search_query in (safe_get(att, "name", "") or "").lower():
+                                return True
+                    return False
+
+                only_fields = _with_fields(only_fields, *(
+                    db_field for area, db_field in (("subject", "subject"), ("body", "text_body"))
+                    if area in search_in
+                ))
+            # The merge below orders by received time.
+            only_fields = _with_fields(only_fields, "datetime_received")
+            per_folder: List[Tuple[str, List[Any]]] = []
             per_folder_errors: List[Dict[str, Any]] = []
             total_available_sum: Optional[int] = 0
             some_total_unknown = False
+            fetch_offset, fetch_limit = _folder_fetch_window(
+                len(folders_to_search), offset, max_results,
+            )
             start_time = datetime.now()
 
             for folder in folders_to_search:
@@ -2138,6 +2308,9 @@ class SearchEmailsTool(BaseTool):
                     combined_filter = q_filters[0]
                     for f in q_filters[1:]:
                         combined_filter |= f
+                    if categories:
+                        # Same restriction as advanced mode: every listed category.
+                        combined_filter &= Q(categories__contains=categories)
 
                     query = folder.filter(combined_filter).order_by('-datetime_received')
                     if only_fields:
@@ -2161,19 +2334,30 @@ class SearchEmailsTool(BaseTool):
                     some_total_unknown = True
                     continue
 
-                outcome = _paginate_query(
-                    query,
-                    max_results=max_results,
-                    offset=offset,
-                    chunk_size=50,
-                    logger=self.logger,
-                    folder_label=folder_name,
-                )
+                if phrase_matcher is None:
+                    outcome = _paginate_query(
+                        query,
+                        max_results=fetch_limit,
+                        offset=fetch_offset,
+                        chunk_size=50,
+                        logger=self.logger,
+                        folder_label=folder_name,
+                    )
+                else:
+                    outcome = _paginate_query_matching(
+                        query,
+                        matcher=phrase_matcher,
+                        max_results=fetch_limit,
+                        offset=fetch_offset,
+                        chunk_size=50,
+                        logger=self.logger,
+                        folder_label=folder_name,
+                    )
                 ews_call_log(
                     self.logger, "FindItem",
                     result_count=len(outcome.items),
                     total_available=outcome.total_available,
-                    page_offset=offset,
+                    page_offset=fetch_offset,
                     folder=folder_name,
                     outcome="ok" if outcome.error_code is None else outcome.error_code,
                     extra_fields={"tool": "search_emails.full_text"},
@@ -2189,32 +2373,19 @@ class SearchEmailsTool(BaseTool):
                         "error_message": outcome.error_message,
                     })
 
-                for item in outcome.items:
-                    # Exact-phrase post-filter stays client-side: the
-                    # EWS ``__contains`` filter already narrowed us.
-                    item_text = ""
-                    if "subject" in search_in:
-                        item_text += (safe_get(item, "subject", "") or "").lower() + " "
-                    if "body" in search_in:
-                        item_text += (safe_get(item, "text_body", "") or "").lower() + " "
-                    attachment_match = False
-                    if "attachments" in search_in and hasattr(item, "attachments") and item.attachments:
-                        for att in item.attachments:
-                            att_name = (safe_get(att, "name", "") or "").lower()
-                            if search_query in att_name:
-                                attachment_match = True
-                                break
-                    if exact_phrase and search_query not in item_text and not attachment_match:
-                        continue
-                    all_results.append(
-                        _build_list_item(item, fields=fields, folder_name=folder_name)
-                    )
+                per_folder.append((folder_name, outcome.items))
 
-            all_results.sort(
-                key=lambda x: x.get("received_time") or "",
-                reverse=True,
+            page, has_more = _merge_folder_page(
+                per_folder,
+                sort_field="datetime_received",
+                descending=True,
+                skip=offset - fetch_offset,
+                limit=max_results,
             )
-            all_results = all_results[:max_results]
+            all_results: List[Dict[str, Any]] = [
+                _build_list_item(item, fields=fields, folder_name=name)
+                for name, item in page
+            ]
 
             total_available: Optional[int] = (
                 None if some_total_unknown else total_available_sum
@@ -2228,7 +2399,7 @@ class SearchEmailsTool(BaseTool):
                 "searched_folders": search_scope,
                 "mailbox": mailbox,
             }
-            if total_available is not None and len(all_results) + offset < total_available:
+            if has_more:
                 response["next_offset"] = offset + len(all_results)
             if per_folder_errors:
                 response["meta"] = {"per_folder_errors": per_folder_errors}
@@ -3123,17 +3294,21 @@ class ReplyEmailTool(BaseTool):
             # Get the reply subject (avoid duplicate RE: prefix)
             reply_subject = add_reply_prefix(original_subject)
 
-            # Determine recipients for the reply
+            # Determine recipients for the reply. Reply-all keeps the original
+            # Cc in Cc rather than promoting it to To.
+            reply_to_list, reply_cc_list, _ = reply_recipients(
+                original_from_email,
+                original_to,
+                original_cc,
+                account.primary_smtp_address,
+                reply_all=reply_all,
+            )
             if reply_all:
-                # Reply all: original sender + all original recipients (except self)
-                reply_to_recipients = [Mailbox(email_address=original_from_email)]
-                for email in original_to + original_cc:
-                    if email != account.primary_smtp_address:
-                        reply_to_recipients.append(Mailbox(email_address=email))
-                self.logger.info(f"Reply-all to {len(reply_to_recipients)} recipient(s)")
+                self.logger.info(
+                    f"Reply-all to {len(reply_to_list)} recipient(s), "
+                    f"cc {len(reply_cc_list)}"
+                )
             else:
-                # Reply: just original sender
-                reply_to_recipients = [Mailbox(email_address=original_from_email)]
                 self.logger.info(f"Reply to {original_from_email}")
 
             # Build the complete reply body manually
@@ -3211,8 +3386,10 @@ class ReplyEmailTool(BaseTool):
                 outbound_tracking_id=tracking_id,
                 subject=reply_subject,
                 body=HTMLBody(complete_body),
-                to_recipients=reply_to_recipients
+                to_recipients=[Mailbox(email_address=e) for e in reply_to_list]
             )
+            if reply_cc_list:
+                message.cc_recipients = [Mailbox(email_address=e) for e in reply_cc_list]
 
             # Set threading headers so reply stays in the same conversation
             original_internet_msg_id = safe_get(original_message, "message_id", None)
@@ -3260,13 +3437,6 @@ class ReplyEmailTool(BaseTool):
                 self.logger.info(f"Added {inline_b64_count} inline (base64) attachment(s)")
             new_attachment_count += attach_outgoing_files(message, outgoing_files)
 
-            # Determine who the reply goes to
-            if reply_all:
-                reply_to_list = [original_from_email] + [e for e in original_to + original_cc
-                                                        if e != account.primary_smtp_address]
-            else:
-                reply_to_list = [original_from_email]
-
             if dry_run:
                 # Everything above only read the original; nothing is sent
                 # and no draft is saved.
@@ -3276,6 +3446,7 @@ class ReplyEmailTool(BaseTool):
                     sent=False,
                     message_checked=True,
                     would_send_to=reply_to_list,
+                    would_cc=reply_cc_list,
                     subject=reply_subject,
                     original_subject=original_subject,
                     reply_all=reply_all,
@@ -3296,6 +3467,7 @@ class ReplyEmailTool(BaseTool):
                 delivery_confirmed=False,
                 original_subject=original_subject,
                 reply_to=reply_to_list,
+                cc=reply_cc_list,
                 reply_all=reply_all,
                 attachments_count=new_attachment_count,
                 inline_attachments_preserved=inline_count,

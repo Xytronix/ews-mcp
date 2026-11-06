@@ -185,12 +185,13 @@ body. `attach_file_link` generates such links only for SmarterMail storage.
 
 **Response.** `send_email` / `reply_email` / `forward_email` report what the
 mail server accepted, not what was delivered: `accepted_by_mail_server: true`
-and `delivery_confirmed: false`. Newly composed messages also carry a
-`tracking_id`, stamped as `X-EWS-MCP-Tracking-ID`, for lookup in raw MIME
-(`get_email_mime`) or a downstream bounce. A saved-draft send preserves
-the draft as-is rather than adding a tracking header. Graph uses native
-reply actions, so a routed Outlook/Microsoft 365 reply reports
-`tracking_id: null` instead of an ID that never reached the wire.
+and `delivery_confirmed: false`. When `OUTBOUND_TRACKING_HEADER` names a
+header, newly composed messages carry a random `tracking_id` in that header
+for lookup in raw MIME (`get_email_mime`) or a downstream bounce. It is off
+by default (`tracking_id: null`). A saved-draft send preserves the draft
+as-is rather than adding a tracking header. Graph uses native reply actions,
+so a routed Outlook/Microsoft 365 reply reports `tracking_id: null` instead
+of an ID that never reached the wire.
 For SMTP, inspect `accepted_recipients`, `refused_recipients` and
 `partial_failure`: an accepted submission may exclude some recipients.
 Sent-copy or draft-cleanup warnings do not undo acceptance. Never retry the
@@ -312,7 +313,7 @@ Three modes selected via `mode`:
 | `is_flagged` | `bool` | filter by Outlook follow-up flag (`PR_FLAG_STATUS=2`). New in v4. |
 | `is_read` | `bool` | |
 | `has_attachments` | `bool` | |
-| `categories` | `string[]` | one or more must match (advanced/full_text) |
+| `categories` | `string[]` | the message must carry every listed category (all modes) |
 | `importance` | `"Low"\|"Normal"\|"High"` | |
 | `subject_contains`, `body_contains`, `from_address`, `to_address` | `string` | |
 | `start_date`, `end_date` | ISO 8601 `string` | |
@@ -404,12 +405,12 @@ quote the original body or copy its inline images.
 | Name | Notes |
 |---|---|
 | `body_format` | `html` / `markdown` / `text` (v4) |
-| `reply_all` | bool, default false |
+| `reply_all` | bool, default false. The sender and original To go in To, the original Cc stays in Cc, without your own address or duplicates |
 | `files` | canonical attachments on **all three providers**; same schema as `send_email`. All files are loaded before sending. |
 | `attachments`, `inline_attachments` | **deprecated, Exchange only**; still additive to `files` on existing supported paths |
 | `cleanup_on_failure` | Graph multi-step send recovery; default false |
 | `folder` | source folder for IMAP messages outside Inbox; use a standard alias or native folder `id`/`path` |
-| `dry_run` | bool, default false: validate and preview without sending. Exchange also reads the original and returns `would_send_to`, `subject`, `message_checked: true`; Graph/IMAP do not touch the provider (`message_checked: false`). Returns `would_attach`, `files_validated`, `files_fetched`. |
+| `dry_run` | bool, default false: validate and preview without sending. Exchange also reads the original and returns `would_send_to`, `would_cc`, `subject`, `message_checked: true`; Graph/IMAP do not touch the provider (`message_checked: false`). Returns `would_attach`, `files_validated`, `files_fetched`. |
 | `verify_files` | with `dry_run`: load every `files` entry to prove it resolves (same as `send_email`) |
 
 On Exchange, the reply body is wrapped in the standard Outlook `WordSection1` div +

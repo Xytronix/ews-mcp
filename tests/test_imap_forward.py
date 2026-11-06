@@ -19,7 +19,6 @@ from src.mail_backends.base import MailBackendError, OutgoingMessage
 from src.mail_backends.imap_backend import IMAPBackend
 from src.mail_backends.registry import MailboxRegistry
 from src.tools.mailbox_tools import ForwardEmailTool
-from src.utils import OUTBOUND_TRACKING_HEADER
 
 
 def original_message():
@@ -112,7 +111,6 @@ def test_forward_preserves_original_mime_and_adds_files_without_private_envelope
     assert b"new-hidden" not in wire
     assert outgoing["Message-ID"] and outgoing["Message-ID"] != original["Message-ID"]
     assert outgoing["Subject"] == "Fwd: Original report"
-    assert outgoing[OUTBOUND_TRACKING_HEADER] == result["tracking_id"]
     html = outgoing.get_body(preferencelist=("html",)).get_content()
     plain = outgoing.get_body(preferencelist=("plain",)).get_content()
     assert "<strong>Review this</strong>" in html

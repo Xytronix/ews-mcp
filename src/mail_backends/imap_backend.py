@@ -36,7 +36,7 @@ from html import escape, unescape
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from ..body_format import compose_body, render_body
-from ..utils import OUTBOUND_TRACKING_HEADER
+from ..utils import outbound_tracking_header
 from .accounts import MailAccount
 from .dav import DAVMixin
 from .base import (
@@ -190,6 +190,19 @@ def _split_message_id(message_id: str) -> Tuple[Optional[str], str]:
             f"invalid IMAP message id {message_id!r}; expected '<uidvalidity>:<uid>'"
         )
     return (validity or None), uid
+
+
+def _stamp_tracking_header(outgoing: Message, tracking_id: Optional[str]) -> Optional[str]:
+    """Set the configured tracking header; return the ID now on the message.
+
+    None while tracking is off: without a header name there is nowhere to
+    publish an ID, so none is reported either.
+    """
+    header = outbound_tracking_header()
+    if not header or not tracking_id:
+        return None
+    outgoing[header] = tracking_id
+    return tracking_id
 
 
 def _detach_part(root: Message, target: Message) -> bool:
@@ -1451,11 +1464,21 @@ class IMAPBackend(DAVMixin, MailBackend):
             if not recipients:
                 recipients = [original.from_address] if original.from_address else []
             if message.reply_all:
-                seen = {a.lower() for a in recipients}
-                for addr in list(original.to) + list(original.cc):
-                    if addr and addr.lower() != self.email.lower() and addr.lower() not in seen:
-                        recipients.append(addr)
-                        seen.add(addr.lower())
+                # Same split as create_reply_draft: the sender and original To
+                # go in To, caller and original Cc in Cc. Nobody appears twice,
+                # we never mail ourselves, and Bcc recipients stay blind.
+                seen = {self.email.lower(), *(address.lower() for address in bcc)}
+                to_all: List[str] = []
+                cc_all: List[str] = []
+                for target, addresses in (
+                    (to_all, recipients + list(original.to)),
+                    (cc_all, cc + list(original.cc)),
+                ):
+                    for address in addresses:
+                        if address and address.lower() not in seen:
+                            target.append(address)
+                            seen.add(address.lower())
+                recipients, cc = to_all, cc_all
 
         if not recipients:
             raise MailBackendError("no recipients: 'to' is required")
@@ -1481,8 +1504,7 @@ class IMAPBackend(DAVMixin, MailBackend):
         if original is not None and original.internet_message_id:
             outgoing["In-Reply-To"] = original.internet_message_id
             outgoing["References"] = original.internet_message_id
-        if message.tracking_id:
-            outgoing[OUTBOUND_TRACKING_HEADER] = message.tracking_id
+        tracking_id = _stamp_tracking_header(outgoing, message.tracking_id)
         outgoing.set_content(text_fallback or re.sub(r"<[^>]+>", "", html))
         outgoing.add_alternative(html, subtype="html")
         self._add_files(outgoing, message.attachments)
@@ -1512,7 +1534,7 @@ class IMAPBackend(DAVMixin, MailBackend):
             "subject": subject or "",
             "replied_to": message.reply_to_message_id,
             "saved_to_sent": None,
-            "tracking_id": message.tracking_id,
+            "tracking_id": tracking_id,
         }
         warnings: List[str] = []
         if refused:
@@ -1572,8 +1594,7 @@ class IMAPBackend(DAVMixin, MailBackend):
         outgoing["Subject"] = message.subject
         outgoing["Date"] = email.utils.formatdate(localtime=True)
         outgoing["Message-ID"] = email.utils.make_msgid(domain=self.email.split("@")[-1])
-        if message.tracking_id:
-            outgoing[OUTBOUND_TRACKING_HEADER] = message.tracking_id
+        _stamp_tracking_header(outgoing, message.tracking_id)
         html, _ = compose_body(message.body, message.body_format)
         text = message.body if message.body_format != "html" else unescape(re.sub(r"<[^>]+>", "", html))
         outgoing.set_content(text)
@@ -1700,6 +1721,7 @@ class IMAPBackend(DAVMixin, MailBackend):
         self, message_id: str, message: OutgoingMessage, folder: str = "inbox",
     ) -> Dict[str, Any]:
         outgoing = self._build_forward(message_id, message, folder)
+        _stamp_tracking_header(outgoing, message.tracking_id)
         if message.bcc:
             outgoing["Bcc"] = ", ".join(message.bcc)
         return self._save_draft(outgoing, message.cleanup_on_failure)
@@ -1779,8 +1801,6 @@ class IMAPBackend(DAVMixin, MailBackend):
         outgoing["Subject"] = subject
         outgoing["Date"] = email.utils.formatdate(localtime=True)
         outgoing["Message-ID"] = email.utils.make_msgid(domain=self.email.split("@")[-1])
-        if message.tracking_id:
-            outgoing[OUTBOUND_TRACKING_HEADER] = message.tracking_id
 
         html, _ = compose_body(message.body or "", message.body_format or "markdown")
         text = message.body if message.body_format != "html" else re.sub(r"<[^>]+>", "", html)
@@ -1833,6 +1853,7 @@ class IMAPBackend(DAVMixin, MailBackend):
         if not recipients:
             raise MailBackendError("no recipients: 'to' is required")
         outgoing = self._build_forward(message_id, message, folder)
+        tracking_id = _stamp_tracking_header(outgoing, message.tracking_id)
         subject = str(outgoing["Subject"])
         envelope = recipients + cc + bcc
         refused = self._smtp_send(outgoing, envelope)
@@ -1849,7 +1870,7 @@ class IMAPBackend(DAVMixin, MailBackend):
             "bcc": bcc,
             "subject": subject,
             "forwarded_from": message_id,
-            "tracking_id": message.tracking_id,
+            "tracking_id": tracking_id,
             "accepted_recipients": accepted,
             "partial_failure": bool(refused),
             "refused_recipients": {

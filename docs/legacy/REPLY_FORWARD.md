@@ -46,7 +46,7 @@ threading headers. Client conversation grouping is not guaranteed.
 |-----------|------|----------|-------------|
 | `message_id` | string | Yes | Message ID in the selected mailbox; IMAP also needs the correct `folder` |
 | `body` | string | Yes | Reply content; interpreted according to `body_format` |
-| `reply_all` | boolean | No | If true, reply to all recipients; if false, reply only to sender (default: false) |
+| `reply_all` | boolean | No | If true, the sender and original To recipients go in To and the original Cc recipients stay in Cc (your own address and duplicates are dropped). If false, reply only to the sender (default: false) |
 | `files` | array | No | Canonical attachment sources; see [API](API.md#attachment-sources) |
 | `attachments` | array | No | **Deprecated, Exchange-only** server-local file paths; use `files` |
 | `inline_attachments` | array | No | **Deprecated, Exchange-only** base64 file objects; use `files` |

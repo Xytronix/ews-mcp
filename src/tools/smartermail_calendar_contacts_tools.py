@@ -21,7 +21,7 @@ import asyncio
 import json
 import re
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
@@ -58,7 +58,8 @@ _DOW_ALIASES = {
     "saturday": 6, "sat": 6, "6": 6,
 }
 
-# reminderIndex dropdown from the webmail bundle (id → minutes). 0 = none.
+# reminderIndex dropdown from the webmail bundle (id → minutes). 0 = none,
+# 1 = a reminder at the event start.
 _REMINDER_MINUTES = {
     0: None,
     1: 0, 2: 5, 3: 10, 4: 15, 5: 30,
@@ -230,8 +231,12 @@ def _reminder_index(kwargs: Dict[str, Any]) -> int:
     minutes = kwargs.get("reminder_minutes")
     if minutes in (None, ""):
         return 0
+    if isinstance(minutes, str) and minutes.strip().lower() == "none":
+        return 0
     want = _as_int(minutes, "reminder_minutes")
-    if want < 0:
+    # 0 means "no reminder" to callers. Snapping it to the nearest table
+    # entry would pick index 1 and set a reminder at the event start.
+    if want <= 0:
         return 0
     best = 0
     best_delta = 10**9
@@ -242,6 +247,28 @@ def _reminder_index(kwargs: Dict[str, Any]) -> int:
         if delta < best_delta:
             best, best_delta = idx, delta
     return best
+
+
+def _until_date_iso(value: Any, start: datetime) -> str:
+    """recurrence.untilDate as UTC ISO.
+
+    A bare date covers that whole day in the event's zone: the webmail stores
+    local 23:59:59 of the chosen day. Midnight would end the series before
+    that day's occurrence. A full datetime is used as given.
+    """
+    day: Optional[date] = None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        day = value
+    elif not isinstance(value, datetime):
+        try:
+            day = date.fromisoformat(str(value).strip())
+        except ValueError:
+            pass
+    if day is not None:
+        until_dt = datetime.combine(day, time(23, 59, 59), tzinfo=start.tzinfo)
+    else:
+        until_dt = _parse_dt(value, "until_date")
+    return until_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _attendees(value: Any) -> List[Dict[str, Any]]:
@@ -286,8 +313,7 @@ def _build_recurrence(kwargs: Dict[str, Any], start: datetime) -> Dict[str, Any]
     dummy_until = (start + timedelta(days=365)).strftime("%Y-%m-%dT23:59:59Z")
     until_date_iso = dummy_until
     if until_date_on:
-        until_dt = _parse_dt(until_date, "until_date")
-        until_date_iso = until_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        until_date_iso = _until_date_iso(until_date, start)
     weekly = _weekly_days(kwargs.get("weekly_days") or kwargs.get("days_of_week"), start)
     month_day = _as_int(kwargs.get("month_day") or start.day, "month_day")
     period_index = _as_int(kwargs.get("monthly_period_index") or max((start.day - 1) // 7, 0), "monthly_period_index")
@@ -711,7 +737,11 @@ class ManageRecurringEventTool(_CalContactTool):
                 },
                 "until_date": {
                     "type": "string",
-                    "description": "Stop on this ISO date (ignored if until_count is set).",
+                    "description": (
+                        "Last day of the series. An ISO date includes that whole day "
+                        "in timezone. A full ISO datetime is used as given. Ignored if "
+                        "until_count is set."
+                    ),
                 },
                 "location": {"type": "string", "description": "Location."},
                 "description": {"type": "string", "description": "HTML or plain-text body."},

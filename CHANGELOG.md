@@ -56,10 +56,11 @@ Upstream's history follows from `[Unreleased]` on.
 - SmarterMail REST tools are opt-in. `SMARTERMAIL_ENABLED` defaults to
   false, and `SMARTERMAIL_ADMIN_TOOLS=true` adds the 8 domain-admin tools.
   `SMARTERMAIL_BASE_URL` defaults to the host of `EWS_SERVER_URL`.
-- Outbound messages set the From header and carry an
-  `X-EWS-MCP-Tracking-ID` header with an `ews-mcp-` ID. Send, reply and
-  forward report `accepted_by_mail_server`, `delivery_confirmed: false` and
-  `tracking_id` instead of claiming delivery.
+- Outbound messages set the From header. Send, reply and forward report
+  `accepted_by_mail_server`, `delivery_confirmed: false` and `tracking_id`
+  instead of claiming delivery. `OUTBOUND_TRACKING_HEADER` names an optional
+  header that carries the tracking ID on the wire. It is off by default
+  because every recipient can read it.
 - The Docker image serves streamable-http on `0.0.0.0:8000`. It is a single
   `python:3.12-slim` stage with LibreOffice, Tesseract, ImageMagick, libheif,
   unar and openssl, and it runs `python -m src.main` as root without
@@ -106,6 +107,37 @@ Upstream's history follows from `[Unreleased]` on.
 - Routed tools no longer crash on duplicate response keys after the provider
   accepted the action.
 - 7z extraction works with py7zr 1.x (requirement raised to 1.1.3).
+- Reply-all keeps the original roles on Exchange and IMAP: the sender and the
+  original To go in To and the original Cc stays in Cc, without our own
+  address and without duplicates (case-insensitive). `create_reply_draft`
+  adds the caller's cc and bcc on top and reports every saved recipient.
+  `reply_email` reports `cc`, and its dry run reports `would_cc`.
+- `search_emails` applies `categories` in quick and full_text modes too, and
+  in quick mode it counts as a filter, so the default 30-day window no longer
+  replaces it.
+- Multi-folder paging in advanced and full_text search merges the folders
+  into one sorted result, so later pages no longer skip or repeat messages.
+  `next_offset` appears whenever more results exist.
+- `search_emails` advanced `sort_by="from"` sorts by sender instead of
+  failing every folder, and a quick search with only `is_flagged` no longer
+  falls back to the default 30-day window.
+- `check_availability` reads free/busy event times in the configured
+  `TIMEZONE`, the zone Exchange answers in, instead of UTC.
+- SmarterMail recurring events: `reminder_minutes=0` (or `"none"`) means no
+  reminder, and a date-only `until_date` includes that whole day in the
+  event's time zone.
+- HTTP transports answer 404 for OAuth discovery paths (any `/.well-known/`
+  path and `/register`) before the API-key check, so MCP clients use the key
+  instead of starting OAuth. Every other endpoint still answers 401 without
+  a valid key.
+- uvicorn access logs mask `api_key`, `token`, `secret`, `password` and
+  `authorization` query parameters.
+- `read_attachment` S/MIME: attached signatures (smime.p7m, CAdES `file.p7m`)
+  verify alone and show their embedded content. Detached `.p7s` signatures
+  verify against the exact signed MIME part instead of the rendered body,
+  and say "not verified" when that part is unavailable. Encrypted `.p7m`
+  (CMS envelopedData/authEnvelopedData) is reported as encrypted instead of
+  failing with "No certificates found".
 
 ### Remote-agent attachments (2026-09-24)
 

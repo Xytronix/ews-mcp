@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.mail_backends.accounts import MailAccount
 from src.mail_backends.base import MailBackendError, OutgoingAttachment, OutgoingMessage
 from src.mail_backends.graph_backend import GraphBackend
+from src.utils import configure_outbound_tracking
 
 
 def graph_backend(handler):
@@ -84,13 +85,16 @@ def test_new_draft_stores_tracking_and_returns_uploaded_ids():
         return httpx.Response(200, json={"value": [{"id": "attachment-id", "name": "file"}]})
 
     backend = graph_backend(handler)
+    previous = configure_outbound_tracking("X-Test-Tracking-ID")
     try:
         result = backend.create_draft(OutgoingMessage(to=["to@example.com"], subject="", body="",
             tracking_id="trace", attachments=[OutgoingAttachment("file", b"x")]))
     finally:
+        configure_outbound_tracking(previous)
         backend.close()
     assert stored["subject"] == ""
-    assert stored["internetMessageHeaders"][0]["value"] == "trace"
+    assert stored["internetMessageHeaders"] == [{"name": "X-Test-Tracking-ID", "value": "trace"}]
+    assert result["tracking_id"] == "trace"
     assert result["attachments"][0]["attachment_id"] == "attachment-id"
 
 

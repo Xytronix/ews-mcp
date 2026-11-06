@@ -264,9 +264,9 @@ class OutgoingMessage:
     reply_to_message_id: Optional[str] = None
     reply_to_folder: Optional[str] = None
     reply_all: bool = False
-    #: correlation ID the backend must publish as
-    #: :data:`src.utils.OUTBOUND_TRACKING_HEADER` on the outbound message.
-    #: A backend that cannot set the header reports ``tracking_id: None``
+    #: correlation ID the backend must publish in the header named by
+    #: :func:`src.utils.outbound_tracking_header`. A backend that cannot set
+    #: the header, or runs with tracking off, reports ``tracking_id: None``
     #: in its send result rather than claiming an ID that is not on the wire.
     tracking_id: Optional[str] = None
     #: Files to send with the message. A backend that cannot carry them

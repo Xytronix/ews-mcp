@@ -15,7 +15,7 @@ from email import policy
 from email.parser import BytesParser
 from typing import List, Optional, Tuple
 
-from .attachment_sniff import sniff_attachment_type
+from .attachment_sniff import find_signed_part, sniff_attachment_type
 from .document_parser import parse_document_bytes, supports_liteparse
 
 _log = logging.getLogger(__name__)
@@ -140,6 +140,14 @@ def extract_attachment_text(
             content,
             signed_content=signed_content,
             html_to_md=_html_to_markdown,
+            extract_inner=lambda payload: extract_attachment_text(
+                payload,
+                "",
+                max_pages=max_pages,
+                extract_tables=extract_tables,
+                password=password,
+                depth=depth + 1,
+            ),
         )
 
     if ext in CERT_EXTENSIONS:
@@ -957,16 +965,14 @@ def parse_eml(
 
     if smime_signatures:
         from .attachment_formats_extra import parse_pkcs7_signature
-        signed_bytes = None
-        if text_body:
-            signed_bytes = text_body.encode("utf-8")
-        elif html_body:
-            signed_bytes = html_body.encode("utf-8")
+
         parts.append("")
         parts.append(
             parse_pkcs7_signature(
                 smime_signatures[0],
-                signed_content=signed_bytes,
+                # The signature covers the exact first part of its
+                # multipart/signed entity, not the rendered body.
+                signed_content=find_signed_part(smime_signatures[0], content),
                 html_to_md=_html_to_markdown,
             )
         )

@@ -26,7 +26,7 @@ from ..utils import (
     sanitize_html,
 )
 from ..body_format import compose_body, WRITE_FORMAT_SCHEMA as BODY_FORMAT_SCHEMA
-from .email_tools import add_reply_prefix, add_forward_prefix
+from .email_tools import add_reply_prefix, add_forward_prefix, reply_recipients
 from .outgoing_attachments import (
     FILES_SCHEMA, load_outgoing_files, attach_outgoing_files, save_draft_with_attachments,
 )
@@ -251,9 +251,9 @@ class CreateReplyDraftTool(BaseTool):
                         "items": {"type": "string"},
                         "description": (
                             "Additional CC recipients to add to the reply draft. "
-                            "These are saved on the draft as cc_recipients alongside "
-                            "the auto-derived to_recipients (sender, plus original "
-                            "to/cc when reply_all=true). Issue #119."
+                            "Saved in Cc alongside the auto-derived recipients: "
+                            "the sender in To, plus the original To in To and the "
+                            "original Cc in Cc when reply_all=true. Issue #119."
                         )
                     },
                     "bcc": {
@@ -329,16 +329,17 @@ class CreateReplyDraftTool(BaseTool):
                 if r and hasattr(r, "email_address") and r.email_address
             ]
 
-            if reply_all:
-                seen = set()
-                reply_to_recipients = []
-                for email in [original_from_email] + original_to + original_cc:
-                    if not email or email == account.primary_smtp_address or email in seen:
-                        continue
-                    seen.add(email)
-                    reply_to_recipients.append(Mailbox(email_address=email))
-            else:
-                reply_to_recipients = [Mailbox(email_address=original_from_email)]
+            # Reply-all keeps the original roles: sender + To in To, original
+            # Cc in Cc. Issue #119: the caller's cc/bcc are added on top.
+            reply_to_list, reply_cc_list, reply_bcc_list = reply_recipients(
+                original_from_email,
+                original_to,
+                original_cc,
+                account.primary_smtp_address,
+                reply_all=reply_all,
+                extra_cc=extra_cc,
+                extra_bcc=extra_bcc,
+            )
 
             header = format_forward_header(original_message)
             safe_from = escape_html(header.get("from", ""))
@@ -376,20 +377,14 @@ class CreateReplyDraftTool(BaseTool):
                 account=account,
                 subject=reply_subject,
                 body=HTMLBody(complete_body),
-                to_recipients=reply_to_recipients,
+                to_recipients=[Mailbox(email_address=e) for e in reply_to_list],
                 folder=account.drafts,
             )
 
-            # Issue #119: persist caller-supplied cc/bcc on the draft.
-            # De-duplicate against to_recipients (already in seen) so a CC'd
-            # address does not also appear in TO when reply_all=True.
-            to_set = {r.email_address for r in reply_to_recipients}
-            cc_to_save = [Mailbox(email_address=e) for e in extra_cc if e and e not in to_set]
-            bcc_to_save = [Mailbox(email_address=e) for e in extra_bcc if e and e not in to_set]
-            if cc_to_save:
-                message.cc_recipients = cc_to_save
-            if bcc_to_save:
-                message.bcc_recipients = bcc_to_save
+            if reply_cc_list:
+                message.cc_recipients = [Mailbox(email_address=e) for e in reply_cc_list]
+            if reply_bcc_list:
+                message.bcc_recipients = [Mailbox(email_address=e) for e in reply_bcc_list]
 
             # Issue #114 — Outlook categories on the reply draft.
             if categories:
@@ -430,10 +425,11 @@ class CreateReplyDraftTool(BaseTool):
                 reply_subject=reply_subject,
                 reply_to=reply_to,
                 reply_all=reply_all,
-                # Issue #119: surface the additional recipients on the
-                # response so callers can sanity-check what landed.
-                cc=[mb.email_address for mb in (cc_to_save or [])],
-                bcc=[mb.email_address for mb in (bcc_to_save or [])],
+                # Issue #119: surface every saved recipient on the response so
+                # callers can sanity-check what landed.
+                to=reply_to_list,
+                cc=reply_cc_list,
+                bcc=reply_bcc_list,
                 attachments_count=attachment_count,
                 inline_attachments_preserved=inline_count,
                 created_time=datetime.now().isoformat(),

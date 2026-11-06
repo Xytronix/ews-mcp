@@ -19,6 +19,7 @@ from ..exceptions import AuthenticationError, EWSConnectionError, ToolExecutionE
 from ..utils import (
     ews_id_to_str,
     new_outbound_tracking_id,
+    outbound_tracking_header,
     find_message_for_account,
     format_datetime,
     parse_datetime_tz_aware,
@@ -672,7 +673,12 @@ class EWSBackend(MailBackend):
                 # ``author`` maps to the writable EWS ``message:From``.
                 # SmarterMail accepts a CreateItem without it and then emits
                 # RFC822 mail with no From header, which bounces downstream.
-                tracking_id = message.tracking_id or new_outbound_tracking_id()
+                # With tracking off there is no header name to carry an ID,
+                # including one a caller supplied.
+                tracking_id = (
+                    message.tracking_id or new_outbound_tracking_id()
+                    if outbound_tracking_header() else None
+                )
                 msg = Message(
                     account=account,
                     author=Mailbox(email_address=account.primary_smtp_address),

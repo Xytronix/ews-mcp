@@ -172,6 +172,7 @@ Source `env` means it is read from the process environment only.
 | `EWS_THROTTLE_MAX_RETRIES` | `4` | env | `search_emails` retries after EWS throttling |
 | `EWS_THROTTLE_BASE_DELAY` | `3` | env | First backoff delay in seconds, doubled on each retry |
 | `EWS_THROTTLE_MAX_DELAY` | `30` | env | Longest backoff delay in seconds |
+| `OUTBOUND_TRACKING_HEADER` | unset (off) | env | Header name that carries a per-message tracking ID on fresh outbound mail, for example `X-Mail-Tracking-ID`. Recipients can see it. Unset or empty adds no header, and sends report `tracking_id: null` |
 
 ### Mailbox accounts
 
@@ -301,10 +302,10 @@ its alias `mailbox`) to select one. Omitting it uses the primary mailbox.
 - `send_email`, `reply_email` and `forward_email` accept `dry_run=true`, and
   `verify_files=true` loads every file during the dry run.
 - Send results report `accepted_by_mail_server` and
-  `delivery_confirmed: false`, never delivery. Fresh outbound messages carry
-  an `X-EWS-MCP-Tracking-ID` header, returned as `tracking_id`. Messages the
-  provider composes server-side, such as Graph replies and forwards, report
-  `tracking_id: null`.
+  `delivery_confirmed: false`, never delivery. With `OUTBOUND_TRACKING_HEADER`
+  set, fresh outbound messages carry that header with a random ID, returned as
+  `tracking_id`. It is off by default, and messages the provider composes
+  server-side (Graph replies and forwards) always report `tracking_id: null`.
 - Queue removal or an undo acknowledgment from SmarterMail does not prove that
   delivery was prevented and cannot recall delivered mail.
 - `search_emails` runs one search at a time per process and retries EWS

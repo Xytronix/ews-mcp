@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from ..body_format import compose_body, render_body
-from ..utils import OUTBOUND_TRACKING_HEADER
+from ..utils import outbound_tracking_header
 from .accounts import MailAccount
 from .base import (
     MailAttachmentContent,
@@ -948,11 +948,17 @@ class GraphBackend(GraphCalendarMixin, GraphContactsMixin, MailBackend):
             payload["ccRecipients"] = self._recipient_payloads(message.cc)
         if message.bcc:
             payload["bccRecipients"] = self._recipient_payloads(message.bcc)
-        if message.tracking_id:
+        tracking_id = self._published_tracking_id(message)
+        if tracking_id:
             payload["internetMessageHeaders"] = [
-                {"name": OUTBOUND_TRACKING_HEADER, "value": message.tracking_id},
+                {"name": outbound_tracking_header(), "value": tracking_id},
             ]
         return payload
+
+    @staticmethod
+    def _published_tracking_id(message: OutgoingMessage) -> Optional[str]:
+        """The ID :meth:`_outgoing_payload` sends; None while tracking is off."""
+        return message.tracking_id if outbound_tracking_header() else None
 
     def create_draft(self, message: OutgoingMessage) -> Dict[str, Any]:
         return self._create_draft(message)
@@ -1032,7 +1038,7 @@ class GraphBackend(GraphCalendarMixin, GraphContactsMixin, MailBackend):
             raise self._draft_failure(
                 exc, draft_id, stage, cleanup=message.cleanup_on_failure,
             ) from exc
-        result["tracking_id"] = None if action else message.tracking_id
+        result["tracking_id"] = None if action else self._published_tracking_id(message)
         return result
 
     def update_draft(
@@ -1144,7 +1150,10 @@ class GraphBackend(GraphCalendarMixin, GraphContactsMixin, MailBackend):
         result = {
             "sent": True, "backend": self.kind, "to": list(message.to),
             "subject": message.subject, "replied_to": message.reply_to_message_id,
-            "tracking_id": None if message.reply_to_message_id else message.tracking_id,
+            "tracking_id": (
+                None if message.reply_to_message_id
+                else self._published_tracking_id(message)
+            ),
             "accepted_by_mail_server": True, "delivery_confirmed": False,
         }
         if draft_id:

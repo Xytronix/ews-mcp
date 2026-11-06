@@ -477,8 +477,9 @@ def _authorized_request(
     supported transport carries the configured key. Never logs the
     presented value; callers get False and a generic 401.
 
-    Operational note: when the query-param form is in use, redact it from
-    any URL/access-log line via ``redact_url_query_secrets()`` before write.
+    Operational note: uvicorn access lines are redacted by
+    ``_RedactAccessLogQuery``. Any other log line that carries a URL must go
+    through ``redact_url_query_secrets()`` first.
     """
     if not api_key:
         return True
@@ -520,6 +521,8 @@ def redact_url_query_secrets(query_string: Any) -> str:
     """
     if not query_string:
         return ""
+    from urllib.parse import unquote_plus
+
     if isinstance(query_string, (bytes, bytearray)):
         text = query_string.decode("utf-8", errors="replace")
     else:
@@ -529,11 +532,57 @@ def redact_url_query_secrets(query_string: Any) -> str:
     for pair in text.split("&"):
         if "=" in pair:
             k, _v = pair.split("=", 1)
-            if k.lower() in redacted_keys:
+            # Decode like the auth parser does: ``api%5Fkey=`` authenticates.
+            if unquote_plus(k).lower() in redacted_keys:
                 out.append(f"{k}=[redacted]")
                 continue
         out.append(pair)
     return "&".join(out)
+
+
+def _is_oauth_discovery_path(path: str) -> bool:
+    """True for OAuth discovery and client-registration probes.
+
+    MCP clients probe ``/.well-known/*`` (at the root, under ``/mcp`` or with
+    the resource path appended) and ``/register``. They read a 401 there as
+    "OAuth required" and start a login flow this server cannot complete. A
+    404 says there is no authorization server, so they keep using the key.
+    """
+    return path.rstrip("/") == "/register" or ".well-known" in path.split("/")
+
+
+def _redact_path_query(path: str) -> str:
+    head, _, query = path.partition("?")
+    return f"{head}?{redact_url_query_secrets(query)}"
+
+
+class _RedactAccessLogQuery(logging.Filter):
+    """Mask secret query parameters in uvicorn access-log records.
+
+    uvicorn passes ``path?query`` as one positional argument, so a client on
+    the ``?api_key=`` transport would write its key into every access line.
+    The argument tuple keeps its shape: uvicorn's AccessFormatter unpacks it.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                _redact_path_query(arg) if isinstance(arg, str) and "?" in arg else arg
+                for arg in record.args
+            )
+        return True
+
+
+def _uvicorn_log_config() -> Dict[str, Any]:
+    """uvicorn's default logging config with access-log query redaction."""
+    import copy
+
+    from uvicorn.config import LOGGING_CONFIG
+
+    config = copy.deepcopy(LOGGING_CONFIG)
+    config.setdefault("filters", {})["redact_query_secrets"] = {"()": _RedactAccessLogQuery}
+    config["loggers"]["uvicorn.access"]["filters"] = ["redact_query_secrets"]
+    return config
 
 
 class EWSMCPServer:
@@ -1322,6 +1371,11 @@ class EWSMCPServer:
                     send, 200, b'{"status":"ok","tools":%d}' % len(self.tools)
                 )
                 return
+            # Before the key check: a 401 on a discovery path sends clients
+            # into an OAuth flow, and /mcp/.well-known/* would get one below.
+            if _is_oauth_discovery_path(path):
+                await _send_json(send, 404, b'{"success":false,"error":"Not Found"}')
+                return
             if path == "/mcp" or path.startswith("/mcp/"):
                 if api_key and not _authorized_request(
                     scope.get("headers") or [], api_key, scope.get("query_string")
@@ -1354,6 +1408,7 @@ class EWSMCPServer:
             host=self.settings.mcp_host,
             port=self.settings.mcp_port,
             log_level=self.settings.log_level.lower(),
+            log_config=_uvicorn_log_config(),
             http="h11",
             timeout_keep_alive=http_keep_alive,
             timeout_graceful_shutdown=30,
@@ -1472,6 +1527,17 @@ class EWSMCPServer:
             })
             await send({"type": "http.response.body", "body": body})
 
+        async def _send_404(send) -> None:
+            await send({
+                "type": "http.response.start",
+                "status": 404,
+                "headers": [[b"content-type", b"text/plain"]],
+            })
+            await send({
+                "type": "http.response.body",
+                "body": b"Not Found",
+            })
+
         def _authorized(headers: list, query_string: Optional[bytes] = None) -> bool:
             """Backward-compatible wrapper around ``_authorized_request``.
 
@@ -1511,6 +1577,12 @@ class EWSMCPServer:
                         "type": "http.response.body",
                         "body": health_body,
                     })
+                    return
+
+                # OAuth discovery probes get a 404 before the key check: a
+                # 401 there tells MCP clients to start an OAuth flow.
+                if _is_oauth_discovery_path(path):
+                    await _send_404(send)
                     return
 
                 # All other endpoints require auth when MCP_API_KEY is set.
@@ -1586,15 +1658,7 @@ class EWSMCPServer:
 
                 else:
                     # Return 404 for unknown routes
-                    await send({
-                        "type": "http.response.start",
-                        "status": 404,
-                        "headers": [[b"content-type", b"text/plain"]],
-                    })
-                    await send({
-                        "type": "http.response.body",
-                        "body": b"Not Found",
-                    })
+                    await _send_404(send)
             elif scope["type"] == "lifespan":
                 # Handle lifespan events
                 while True:
@@ -1618,6 +1682,7 @@ class EWSMCPServer:
             host=self.settings.mcp_host,
             port=self.settings.mcp_port,
             log_level=self.settings.log_level.lower(),
+            log_config=_uvicorn_log_config(),
             http="h11",
             timeout_keep_alive=http_keep_alive,
             timeout_graceful_shutdown=30,

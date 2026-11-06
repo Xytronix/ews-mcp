@@ -291,32 +291,70 @@ def truncate_text(text: str, max_length: int = 100) -> str:
     return text[:max_length - 3] + "..."
 
 
-#: Custom RFC 822 header carrying our correlation ID on every outbound
-#: message. ``Message.send()`` returns no server-side ID, so this header is
-#: the only way to find a sent message again in raw MIME or in the logs of
-#: whatever hop rejected it.
-OUTBOUND_TRACKING_HEADER = "X-EWS-MCP-Tracking-ID"
+#: Environment variable naming the custom RFC 822 header that carries a
+#: correlation ID on every fresh outbound message. ``Message.send()`` returns
+#: no server-side ID, so the header is the only way to find a sent message
+#: again in raw MIME or in the logs of whatever hop rejected it. Unset or
+#: empty turns tracking off: no header on the wire and ``tracking_id: None``.
+TRACKING_HEADER_ENV = "OUTBOUND_TRACKING_HEADER"
+
+# exchangelib refuses to register the property without a name. While tracking
+# is off no caller sets a value and exchangelib omits unset properties, so
+# this name never reaches an outbound message.
+_UNCONFIGURED_TRACKING_PROPERTY = "X-Outbound-Tracking-ID"
+
+_outbound_tracking_header: Optional[str] = None
 
 
-def new_outbound_tracking_id() -> str:
-    """Create a correlation ID to carry in :data:`OUTBOUND_TRACKING_HEADER`."""
-    return f"ews-mcp-{uuid4().hex}"
+def outbound_tracking_header() -> Optional[str]:
+    """The configured tracking header name, or None while tracking is off."""
+    return _outbound_tracking_header
+
+
+def new_outbound_tracking_id() -> Optional[str]:
+    """Create a correlation ID for :func:`outbound_tracking_header`.
+
+    None while tracking is off, so callers that pass it straight through put
+    nothing on the wire and report ``tracking_id: None``.
+    """
+    return uuid4().hex if _outbound_tracking_header else None
 
 
 class OutboundTrackingId(ExtendedProperty):
-    """Carries :data:`OUTBOUND_TRACKING_HEADER` into the sent MIME message.
+    """Carries the tracking header into the sent MIME message.
 
-    Registered as ``Message.outbound_tracking_id``. It lives here, next to the
-    header constant, so both the Exchange tools and the EWS mail backend can
-    stamp an outbound message without either importing the other.
+    Registered as ``Message.outbound_tracking_id`` even while tracking is off,
+    so the Exchange tools can always pass the kwarg. It lives here, next to
+    the header setting, so both the Exchange tools and the EWS mail backend
+    can stamp an outbound message without either importing the other.
     """
 
     distinguished_property_set_id = "InternetHeaders"
-    property_name = OUTBOUND_TRACKING_HEADER
+    property_name = _UNCONFIGURED_TRACKING_PROPERTY
     property_type = "String"
 
 
-Message.register("outbound_tracking_id", OutboundTrackingId)
+def configure_outbound_tracking(name: Optional[str]) -> Optional[str]:
+    """Turn tracking on with header *name*, or off when it is None or empty.
+
+    Returns the previous header name so tests can restore it. The Exchange
+    property is re-registered so exchangelib validates the new name, which it
+    then writes on every message that sets ``outbound_tracking_id``.
+    """
+    global _outbound_tracking_header
+    previous = _outbound_tracking_header
+    header = (name or "").strip() or None
+    OutboundTrackingId.property_name = header or _UNCONFIGURED_TRACKING_PROPERTY
+    try:
+        Message.deregister("outbound_tracking_id")
+    except ValueError:
+        pass  # first configuration at import: nothing registered yet
+    Message.register("outbound_tracking_id", OutboundTrackingId)
+    _outbound_tracking_header = header
+    return previous
+
+
+configure_outbound_tracking(os.environ.get(TRACKING_HEADER_ENV))
 
 
 def safe_get(obj: Any, attr: str, default: Any = None) -> Any:

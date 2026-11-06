@@ -3,7 +3,7 @@
 import logging
 from typing import Any, Dict, Optional
 from datetime import datetime, timedelta
-from exchangelib import CalendarItem, Mailbox, Attendee, EWSTimeZone
+from exchangelib import CalendarItem, Mailbox, Attendee
 from exchangelib.items import SEND_TO_ALL_AND_SAVE_COPY, SEND_TO_NONE
 
 from .base import BaseTool
@@ -42,16 +42,17 @@ def get_timezone():
     return None
 
 
-def format_free_busy_datetime(dt):
+def format_free_busy_datetime(dt, request_tz):
     """Format free/busy datetimes in the configured local timezone.
 
-    Exchange free/busy responses may contain naive UTC datetimes. Convert those
-    explicitly so user-facing output matches the requested mailbox timezone.
+    exchangelib hands back CalendarEvent times naive. EWS writes them in the
+    time zone of the GetUserAvailability request, which exchangelib takes from
+    the start datetime's tzinfo, so callers pass that zone as ``request_tz``.
     """
     if dt is None:
         return None
     if getattr(dt, "tzinfo", None) is None:
-        dt = dt.replace(tzinfo=EWSTimeZone("UTC"))
+        dt = dt.replace(tzinfo=request_tz)
     return dt.astimezone(get_configured_timezone()).isoformat()
 
 
@@ -797,8 +798,8 @@ class CheckAvailabilityTool(BaseTool):
                 if calendar_events:
                     for event in calendar_events:
                         result["calendar_events"].append({
-                            "start": format_free_busy_datetime(event.start) if hasattr(event, 'start') else None,
-                            "end": format_free_busy_datetime(event.end) if hasattr(event, 'end') else None,
+                            "start": format_free_busy_datetime(event.start, start_time.tzinfo) if hasattr(event, 'start') else None,
+                            "end": format_free_busy_datetime(event.end, start_time.tzinfo) if hasattr(event, 'end') else None,
                             "busy_type": str(event.busy_type) if hasattr(event, 'busy_type') else "Busy",
                             "details": safe_get(event, 'details')
                         })

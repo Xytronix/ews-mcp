@@ -15,6 +15,8 @@ from email import policy
 from email.parser import BytesParser
 from typing import Callable, List, Optional, Tuple
 
+from .attachment_sniff import ENCRYPTED_CMS_KINDS, CmsInfo, sniff_attachment_type, sniff_cms
+
 def _decode_text(content: bytes) -> str:
     if not content:
         return ""
@@ -291,73 +293,56 @@ def parse_certificate(content: bytes, ext: str) -> str:
 
 
 def _openssl_cms_verify(
-    content: bytes,
+    signature: bytes,
     *,
-    signed_content: Optional[bytes] = None,
+    informs: Tuple[str, ...] = ("DER",),
+    detached_content: Optional[bytes] = None,
 ) -> Tuple[Optional[bytes], str]:
-    """Extract signed payload from PKCS#7/CMS using OpenSSL.
+    """Verify a PKCS#7/CMS signature with OpenSSL and return the signed payload.
 
-    Returns (payload_bytes, mode) where mode is embedded, detached, or none.
+    Returns (payload_bytes, mode) where mode is embedded or detached on
+    success, else ``failed: <reason>``. ``-noverify`` checks the signature
+    over the content but not the signer certificate's chain of trust.
+    ``detached_content`` is only for a signature without encapsulated
+    content: OpenSSL fails an attached signature handed outside content.
     """
-    tmp_sig = None
-    tmp_body = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False) as sig_f:
-            sig_f.write(content)
-            tmp_sig = sig_f.name
-        cmd = [
-            "openssl", "cms", "-verify",
-            "-in", tmp_sig,
-            "-noverify",
-            "-out", "/dev/stdout",
-        ]
+    with tempfile.TemporaryDirectory() as tmp:
+        sig_path = os.path.join(tmp, "signature")
+        with open(sig_path, "wb") as sig_f:
+            sig_f.write(signature)
+        cmd = ["openssl", "cms", "-verify", "-noverify", "-in", sig_path]
+        if detached_content is not None:
+            content_path = os.path.join(tmp, "content")
+            with open(content_path, "wb") as body_f:
+                body_f.write(detached_content)
+            # The signed part is already in CRLF canonical form. -binary
+            # verifies exactly those bytes.
+            cmd.extend(["-content", content_path, "-binary"])
         last_proc = None
-        for inform in ("SMIME", "PEM", "DER"):
-            attempt = [*cmd, "-inform", inform]
-            if signed_content is not None:
-                with tempfile.NamedTemporaryFile(delete=False) as body_f:
-                    body_f.write(signed_content)
-                    tmp_body = body_f.name
-                attempt.extend(["-content", tmp_body])
+        for inform in informs:
             try:
                 last_proc = subprocess.run(
-                    attempt,
+                    [*cmd, "-inform", inform],
                     capture_output=True,
                     timeout=30,
                     check=False,
                 )
             except FileNotFoundError as exc:
                 raise RuntimeError("openssl not available for S/MIME extraction") from exc
-            if last_proc.returncode == 0 and last_proc.stdout:
-                mode = "detached" if signed_content is not None else "embedded"
+            if last_proc.returncode == 0:
+                mode = "detached" if detached_content is not None else "embedded"
                 return last_proc.stdout, mode
-            if tmp_body:
-                try:
-                    os.unlink(tmp_body)
-                except OSError:
-                    pass
-                tmp_body = None
-        if last_proc is None:
-            return None, "none"
-        if b"no content" in last_proc.stderr.lower():
-            return None, "detached"
-        err = last_proc.stderr.decode("utf-8", errors="replace")[:300]
-        if err:
-            return None, f"failed: {err.strip()}"
-        return None, "none"
-    finally:
-        for path in (tmp_sig, tmp_body):
-            if path:
-                try:
-                    os.unlink(path)
-                except OSError:
-                    pass
+    err = ""
+    if last_proc is not None:
+        err = last_proc.stderr.decode("utf-8", errors="replace")[:300].strip()
+    return None, f"failed: {err}" if err else "failed"
 
 
 def _format_pkcs7_payload(
     payload: bytes,
     *,
     html_to_md: Optional[Callable[[str], str]] = None,
+    extract_inner: Optional[Callable[[bytes], str]] = None,
 ) -> str:
     if not payload.strip():
         return "[empty signed payload]"
@@ -381,6 +366,13 @@ def _format_pkcs7_payload(
                     parts.append(body.strip())
             if parts:
                 return "\n\n".join(parts)
+        except Exception:
+            pass
+    if extract_inner is not None and sniff_attachment_type(payload, ""):
+        # Signed documents (CAdES contract.pdf.p7m) wrap a whole file: hand a
+        # recognisable format to its own parser instead of dumping its bytes.
+        try:
+            return extract_inner(payload)
         except Exception:
             pass
     return text.strip()
@@ -412,22 +404,53 @@ def _load_pkcs7_certificates(content: bytes):
             ]
 
 
+def _describe_encrypted_cms(info: CmsInfo) -> str:
+    return (
+        f"--- S/MIME encrypted content (CMS {info.kind}, OID {info.oid}) ---\n"
+        "This attachment is encrypted. Only the private key of one of its "
+        "recipients can decrypt it, and this server holds no such key, so the "
+        "content cannot be read here."
+    )
+
+
 def parse_pkcs7_signature(
     content: bytes,
     *,
     signed_content: Optional[bytes] = None,
     html_to_md: Optional[Callable[[str], str]] = None,
+    extract_inner: Optional[Callable[[bytes], str]] = None,
 ) -> str:
+    """Describe an S/MIME / CMS file and verify its signature when possible.
+
+    ``signed_content`` is the exact signed MIME part of a detached signature
+    (see ``find_signed_part``). It is ignored when the SignedData carries its
+    own content.
+    """
+    info = sniff_cms(content)
+    if info is not None and info.kind in ENCRYPTED_CMS_KINDS:
+        return _describe_encrypted_cms(info)
+
     try:
         from cryptography import x509  # noqa: F401
     except ImportError as exc:
         raise RuntimeError("cryptography not installed. Run: pip install cryptography") from exc
 
-    certs = _load_pkcs7_certificates(content)
+    certs = _load_pkcs7_certificates(info.der if info else content)
     if not certs:
         raise RuntimeError("No certificates found in PKCS#7 / signature file")
 
-    payload, mode = _openssl_cms_verify(content, signed_content=signed_content)
+    if info is None:
+        # Not a ContentInfo we can read: let OpenSSL try its input formats.
+        payload, mode = _openssl_cms_verify(content, informs=("SMIME", "PEM", "DER"))
+    elif not info.detached:
+        payload, mode = _openssl_cms_verify(info.der)
+    else:
+        detached = info.signed_part if info.signed_part is not None else signed_content
+        if detached is None:
+            payload, mode = None, "unavailable"
+        else:
+            payload, mode = _openssl_cms_verify(info.der, detached_content=detached)
+
     lines = [f"--- S/MIME PKCS#7 ({len(certs)} certificate(s)) ---"]
     for i, cert in enumerate(certs, 1):
         lines.append(f"\n## Signer certificate {i}")
@@ -435,18 +458,24 @@ def parse_pkcs7_signature(
         lines.append(f"issuer: {cert.issuer.rfc4514_string()}")
         lines.append(f"expires: {cert.not_valid_after_utc}")
 
-    if payload:
-        lines.append(f"\n### Signed content ({mode})")
-        formatted = _format_pkcs7_payload(payload, html_to_md=html_to_md)
-        lines.append(formatted[:20000])
-    elif mode == "detached":
+    lines.append("\n### Signature")
+    if payload is not None:
         lines.append(
-            "\n### Signed content\n"
-            "[detached signature — signed body is separate from this .p7s file. "
-            "Pass the parent email body as signed content, or read the email body directly.]"
+            "valid: the signed content matches the signature "
+            "(the signer certificate was not checked against a trust store)"
+        )
+        lines.append(f"\n### Signed content ({mode})")
+        formatted = _format_pkcs7_payload(
+            payload, html_to_md=html_to_md, extract_inner=extract_inner
+        )
+        lines.append(formatted[:20000])
+    elif mode == "unavailable":
+        lines.append(
+            "not verified: detached signature. The content it signs is not in "
+            "this file and could not be read from the message's MIME."
         )
     else:
-        lines.append(f"\n### Signed content\n[not extracted: {mode}]")
+        lines.append(f"verification {mode}")
 
     return "\n".join(lines).strip()
 

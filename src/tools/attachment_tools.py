@@ -22,7 +22,7 @@ from ..utils import (
 )
 from ..attachment_parsers import extract_attachment_text
 from ..attachment_password import guess_passwords_from_email, is_password_protected_error
-from ..attachment_sniff import extension_from_filename
+from ..attachment_sniff import extension_from_filename, find_signed_part, needs_detached_content
 from ..body_format import render_body
 from ..attachment_sources import (
     ALIAS_DESCRIPTION,
@@ -202,20 +202,22 @@ def _message_body_text(message) -> str:
     return text_body
 
 
-def _signed_content_bytes(message) -> bytes | None:
-    """Best-effort signed body bytes for detached S/MIME .p7s verification."""
-    text_body = safe_get(message, "text_body", "") or ""
-    if text_body:
-        return text_body.encode("utf-8")
-    html_body = str(safe_get(message, "body", "") or "")
-    if html_body:
-        return html_body.encode("utf-8")
+def _detached_signed_content(content: bytes, message) -> bytes | None:
+    """Exact signed MIME part for a detached S/MIME signature, if obtainable.
+
+    Only a SignedData without encapsulated content needs it: OpenSSL fails an
+    attached signature (smime.p7m, CAdES .p7m) that is also handed outside
+    content, and a detached one verifies only against the raw signed part,
+    never the rendered body. The EWS lookup already fetched mime_content.
+    """
+    if not needs_detached_content(content):
+        return None
     mime_content = safe_get(message, "mime_content", None)
-    if mime_content:
-        if isinstance(mime_content, str):
-            return mime_content.encode("utf-8")
-        return bytes(mime_content)
-    return None
+    if not mime_content:
+        return None
+    if isinstance(mime_content, str):
+        mime_content = mime_content.encode("utf-8")
+    return find_signed_part(content, bytes(mime_content))
 
 
 def _extract_with_password_fallback(
@@ -1016,8 +1018,9 @@ class ReadAttachmentTool(BaseTool):
                 "Broad format support: Office/PDF/images, ICS/VCF/QFX/MT940, iWork, "
                 "ZIP/7Z/TAR/RAR, EPUB, PKPass, XPS, certs/PGP/S-MIME, DWG/DXF, "
                 "KML/GPX, Parquet/Avro, RTF, MSG/EML/MIME, HTML/MHTML, config/text; "
-                "magic-byte sniffing; password for PDF/ZIP/7Z/RAR; detached .p7s "
-                "uses parent email body as signed content."
+                "magic-byte sniffing; password for PDF/ZIP/7Z/RAR; S/MIME "
+                "signatures verified (detached .p7s against the message's signed "
+                "MIME part); encrypted .p7m reported, not decrypted."
             ),
             "inputSchema": {
                 "type": "object",
@@ -1123,7 +1126,7 @@ class ReadAttachmentTool(BaseTool):
                 file_ext,
                 body_text=_message_body_text(message),
                 signed_content=(
-                    _signed_content_bytes(message)
+                    _detached_signed_content(content, message)
                     if file_ext in SIGNATURE_EXTENSIONS
                     else None
                 ),

@@ -94,7 +94,7 @@ from .attachment_tools import (
     refuse_oversize_bytes,
     resolve_download_path,
 )
-from ..attachment_sniff import extension_from_filename
+from ..attachment_sniff import extension_from_filename, find_signed_part, needs_detached_content
 from ..body_format import DEFAULT_READ_FORMAT
 
 
@@ -1314,15 +1314,25 @@ class ReadAttachmentTool(RoutedMailTool, _ExchangeReadAttachmentTool):
             raise ToolExecutionError("Attachment content is empty")
         file_ext = extension_from_filename(attachment.name)
 
-        # The parent body only matters for password hints (archives/PDF) and
-        # detached S/MIME signatures — don't pay for it otherwise.
+        # The parent body only matters for password hints (archives/PDF), so
+        # don't pay for it otherwise.
         body_text = ""
-        signed_content = None
-        if file_ext in ARCHIVE_EXTENSIONS or file_ext in SIGNATURE_EXTENSIONS or file_ext == "pdf":
+        if file_ext in ARCHIVE_EXTENSIONS or file_ext == "pdf":
             parent = await self.call(backend.get_message, message_id, folder, "text")
             body_text = parent.body or ""
-            if file_ext in SIGNATURE_EXTENSIONS and body_text:
-                signed_content = body_text.encode("utf-8")
+
+        # A detached S/MIME signature verifies only against the exact signed
+        # part of the raw message. Fetch the MIME only for a signature with no
+        # content of its own. Attached and encrypted ones need nothing more.
+        signed_content = None
+        if file_ext in SIGNATURE_EXTENSIONS and needs_detached_content(attachment.content):
+            try:
+                raw_mime = await self.call(backend.get_mime, message_id, folder)
+            except MailBackendError:
+                # No MIME export on this backend: the signature is reported
+                # as unverifiable rather than failing the read.
+                raw_mime = None
+            signed_content = find_signed_part(attachment.content, raw_mime)
 
         extracted_text, password_used = await asyncio.to_thread(
             _extract_with_password_fallback,
