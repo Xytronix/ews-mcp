@@ -69,6 +69,8 @@ Upstream's history follows from `[Unreleased]` on.
 - SmarterMail REST tools are opt-in. `SMARTERMAIL_ENABLED` defaults to
   false, and `SMARTERMAIL_ADMIN_TOOLS=true` adds the 8 domain-admin tools.
   `SMARTERMAIL_BASE_URL` defaults to the host of `EWS_SERVER_URL`.
+  `SMARTERMAIL_TIMEZONE` sets the zone for recurring events that name none,
+  without moving the other backends off `TIMEZONE`.
 - Outbound messages set the From header. Send, reply and forward report
   `accepted_by_mail_server`, `delivery_confirmed: false` and `tracking_id`
   instead of claiming delivery. `OUTBOUND_TRACKING_HEADER` names an optional

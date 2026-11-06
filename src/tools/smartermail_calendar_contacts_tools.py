@@ -141,8 +141,10 @@ def _zone(name: Optional[str]) -> ZoneInfo:
 
 
 def _default_tz(tool: Any) -> str:
-    """The server's TIMEZONE setting, used when a call names no timezone."""
-    return (getattr(tool.ews_client.config, "timezone", None) or "UTC").strip() or "UTC"
+    """SMARTERMAIL_TIMEZONE, else TIMEZONE, for a call that names no timezone."""
+    config = tool.ews_client.config
+    name = getattr(config, "smartermail_timezone", None) or getattr(config, "timezone", None)
+    return (name or "UTC").strip() or "UTC"
 
 
 def _parse_dt(value: Any, name: str, tz_name: Optional[str] = None) -> datetime:
@@ -715,7 +717,7 @@ class ManageRecurringEventTool(_CalContactTool):
                 },
                 "timezone": {
                     "type": "string",
-                    "description": "IANA timezone for start/end. Defaults to the server TIMEZONE setting.",
+                    "description": "IANA timezone for start/end. Defaults to SMARTERMAIL_TIMEZONE, else the server TIMEZONE setting.",
                 },
                 "pattern": {
                     "type": "string",
@@ -956,7 +958,7 @@ class UpdateEventOccurrenceTool(_CalContactTool):
                 "end": {"type": "string", "description": "New end (ISO) for this occurrence."},
                 "timezone": {
                     "type": "string",
-                    "description": "IANA timezone for start/end. Defaults to the server TIMEZONE setting.",
+                    "description": "IANA timezone for start/end. Defaults to SMARTERMAIL_TIMEZONE, else the server TIMEZONE setting.",
                 },
                 "notify": {
                     "type": "boolean",

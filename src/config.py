@@ -7,6 +7,7 @@ from exchangelib import Build, Version
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, field_validator, model_validator
 from typing import Callable, Literal, Optional
+from zoneinfo import ZoneInfo
 
 
 #: Exchange product names EWS_VERSION accepts ("2016", "2013_SP1", "O365"),
@@ -170,10 +171,13 @@ class Settings(BaseSettings):
     # the tools only work against a SmarterMail server. Base URL defaults to
     # the host of ews_server_url; credentials are the mailbox passwords the
     # EWS side already uses. Admin tools need a second opt-in because they
-    # can rename, disable and delete accounts.
+    # can rename, disable and delete accounts. smartermail_timezone is the
+    # zone for SmarterMail recurring events that name none; unset, they use
+    # timezone, which also governs every other backend.
     smartermail_enabled: bool = False
     smartermail_base_url: Optional[str] = None
     smartermail_admin_tools: bool = False
+    smartermail_timezone: Optional[str] = None
     timezone: str = "UTC"
     log_level: str = "INFO"
 
@@ -295,6 +299,19 @@ class Settings(BaseSettings):
     def check_ews_version(cls, value: str) -> str:
         """Fail at startup, naming the accepted forms, on an unknown version."""
         parse_ews_version(value)
+        return value
+
+    @field_validator("smartermail_timezone")
+    @classmethod
+    def check_smartermail_timezone(cls, value: Optional[str]) -> Optional[str]:
+        """Blank means unset. An unknown zone fails at startup."""
+        value = (value or "").strip()
+        if not value:
+            return None
+        try:
+            ZoneInfo(value)
+        except Exception as exc:
+            raise ValueError(f"SMARTERMAIL_TIMEZONE={value!r} is not an IANA time zone name") from exc
         return value
 
     @model_validator(mode='after')

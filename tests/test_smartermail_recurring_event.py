@@ -37,9 +37,9 @@ class CalendarRest:
         raise AssertionError(f"unexpected {method} {path}")
 
 
-def run(rest, server_tz="UTC", **kwargs):
+def run(rest, server_tz="UTC", smartermail_tz=None, **kwargs):
     client = SimpleNamespace(
-        config=SimpleNamespace(ews_email=rest.email, timezone=server_tz),
+        config=SimpleNamespace(ews_email=rest.email, timezone=server_tz, smartermail_timezone=smartermail_tz),
         smartermail=SimpleNamespace(enabled=True, get=lambda target: rest),
         mailbox_registry=None,
     )
@@ -110,3 +110,14 @@ def test_date_only_until_uses_the_event_zone_west_of_utc():
 def test_full_datetime_until_is_kept_as_given():
     payload = create(CalendarRest(), until_date="2026-09-10T12:00:00+02:00")
     assert payload["recurrence"]["untilDate"] == "2026-09-10T10:00:00Z"
+
+
+@pytest.mark.parametrize(("smartermail_tz", "zone"), [
+    ("Europe/Berlin", "Europe/Berlin"),
+    (None, "America/New_York"),
+], ids=["smartermail-timezone", "server-timezone"])
+def test_unnamed_timezone_uses_smartermail_timezone_then_server_timezone(smartermail_tz, zone):
+    rest = CalendarRest()
+    run(rest, server_tz="America/New_York", smartermail_tz=smartermail_tz, action="create",
+        subject="Standup", start="2026-09-01T09:00:00", end="2026-09-01T09:15:00", pattern="daily")
+    assert rest.saved[0]["start"] == {"dt": "2026-09-01T09:00:00.000", "tz": zone}

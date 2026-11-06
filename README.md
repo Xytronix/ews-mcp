@@ -166,6 +166,7 @@ Source `env` means it is read from the process environment only.
 | `SMARTERMAIL_ENABLED` | `false` | settings | Register the 31 SmarterMail REST tools |
 | `SMARTERMAIL_BASE_URL` | scheme and host of `EWS_SERVER_URL` | settings | SmarterMail web address |
 | `SMARTERMAIL_ADMIN_TOOLS` | `false` | settings | Also register the 8 domain-administration tools |
+| `SMARTERMAIL_TIMEZONE` | unset (uses `TIMEZONE`) | settings | IANA zone for SmarterMail recurring events that name none, for example `Europe/Berlin`. It leaves the other backends on `TIMEZONE`. An unknown zone stops startup |
 | `EWS_MCP_STAGING_DIR` | `/tmp/ews-mcp-staged` | env | Directory for staged outbound files |
 | `RATE_LIMIT_REQUESTS_PER_MINUTE` | `120` | settings | Tool calls per minute. Upstream's default is 25 |
 | `RATE_LIMIT_MAX_WAIT_SECONDS` | `60` | env | How long a tool call waits for a rate-limit slot before it fails |
@@ -267,8 +268,8 @@ against a SmarterMail server and refuse Graph and IMAP mailboxes.
 - `SMARTERMAIL_ADMIN_TOOLS=true` also registers the domain-admin group. Those
   tools need a domain administrator account and can create, rename, disable
   and delete mailboxes.
-- When a call names no time zone, the recurring-event tools use the server
-  `TIMEZONE` setting, which is UTC unless set.
+- When a call names no time zone, the recurring-event tools use
+  `SMARTERMAIL_TIMEZONE`, else the server `TIMEZONE` setting (UTC unless set).
 - `storage_file_id` attachment sources also need `SMARTERMAIL_ENABLED=true`.
 
 ## Provider scope and limits
