@@ -38,6 +38,9 @@ _PROVIDER_KINDS: Dict[str, str] = {
     "o365": "graph",
     "m365": "graph",
     "microsoft365": "graph",
+    "jmap": "jmap",
+    "fastmail": "jmap",
+    "stalwart": "jmap",
 }
 
 # Connection defaults per provider spelling. Only IMAP needs host/port; Graph
@@ -74,6 +77,7 @@ _PRESETS: Dict[str, Dict[str, Any]] = {
         "caldav_url": "https://caldav.icloud.com/",
         "carddav_url": "https://contacts.icloud.com/",
     },
+    "fastmail": {"session_url": "https://api.fastmail.com/jmap/session"},
 }
 
 # Keys copied out of a flat account dict into ``settings``.
@@ -98,9 +102,16 @@ _SETTING_KEYS = (
     "graph_token_url",
     "graph_scope",
     "shared_mailbox",
+    "oauth_token_url",
+    "session_url",
+    "api_token",
+    "jmap_username",
 )
 
-_SECRET_KEYS = frozenset({"client_secret", "refresh_token"})
+_SECRET_KEYS = frozenset({"client_secret", "refresh_token", "api_token"})
+
+#: Token endpoint for IMAP/SMTP XOAUTH2 when ``oauth_token_url`` is unset.
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 
 
 class AccountConfigError(ValueError):
@@ -119,8 +130,13 @@ class MailAccount:
 
     @property
     def kind(self) -> str:
-        """Backend kind: ``ews`` | ``imap`` | ``graph``."""
+        """Backend kind: ``ews`` | ``imap`` | ``graph`` | ``jmap``."""
         return _PROVIDER_KINDS.get(self.provider, "ews")
+
+    @property
+    def uses_oauth(self) -> bool:
+        """IMAP/SMTP signs in with XOAUTH2 when a refresh token is configured."""
+        return self.kind == "imap" and bool(self.get("refresh_token"))
 
     @property
     def key(self) -> str:
@@ -141,6 +157,14 @@ class MailAccount:
         if self.kind == "imap":
             out["imap"] = f"{self.get('imap_host')}:{self.get('imap_port')}"
             out["smtp"] = f"{self.get('smtp_host')}:{self.get('smtp_port')}"
+            out["auth"] = "oauth2" if self.uses_oauth else "password"
+            if self.get("caldav_url"):
+                out["caldav"] = self.get("caldav_url")
+            if self.get("carddav_url"):
+                out["carddav"] = self.get("carddav_url")
+        elif self.kind == "jmap":
+            out["session_url"] = self.get("session_url")
+            out["auth"] = "bearer" if self.get("api_token") else "basic"
             if self.get("caldav_url"):
                 out["caldav"] = self.get("caldav_url")
             if self.get("carddav_url"):
@@ -159,10 +183,15 @@ class MailAccount:
         if not self.email or "@" not in self.email:
             raise AccountConfigError(f"invalid mailbox address: {self.email!r}")
         if self.kind == "imap":
-            if not self.password:
+            if self.uses_oauth:
+                if not self.get("client_id"):
+                    raise AccountConfigError(
+                        f"{self.email}: IMAP OAuth sign-in needs client_id with refresh_token"
+                    )
+            elif not self.password:
                 raise AccountConfigError(
-                    f"{self.email}: IMAP mailbox needs a password "
-                    f"(iCloud requires an app-specific password)"
+                    f"{self.email}: IMAP mailbox needs a password or an OAuth "
+                    f"refresh_token (iCloud requires an app-specific password)"
                 )
             if not self.get("imap_host"):
                 raise AccountConfigError(
@@ -178,6 +207,16 @@ class MailAccount:
                 raise AccountConfigError(
                     f"{self.email}: Graph mailbox needs either refresh_token "
                     f"(delegated) or client_secret (app-only)"
+                )
+        elif self.kind == "jmap":
+            if not self.get("session_url"):
+                raise AccountConfigError(
+                    f"{self.email}: JMAP mailbox needs session_url "
+                    f"(or provider=fastmail for the Fastmail default)"
+                )
+            if not self.get("api_token") and not self.password:
+                raise AccountConfigError(
+                    f"{self.email}: JMAP mailbox needs api_token (bearer) or a password (basic)"
                 )
         elif self.kind == "ews" and not self.password:
             raise AccountConfigError(f"{self.email}: EWS mailbox needs a password")
@@ -299,11 +338,14 @@ def accounts_from_env(environ: Optional[Mapping[str, str]] = None) -> List[MailA
             )
         )
 
-    # Gmail over IMAP/SMTP: needs a Google *App Password* (16 chars, account
-    # must have 2-Step Verification). The normal account password is refused.
+    # Gmail over IMAP/SMTP: OAuth 2.0 (XOAUTH2; get the refresh token with
+    # ``python -m src.mail_backends.google_oauth``) or a Google *App Password*
+    # (16 chars, account must have 2-Step Verification). The normal account
+    # password is refused. With both set, OAuth is used.
     gmail_email = (env.get("GMAIL_EMAIL") or "").strip()
     gmail_password = (env.get("GMAIL_APP_PASSWORD") or "").replace(" ", "").strip()
-    if gmail_email and gmail_password:
+    gmail_refresh_token = (env.get("GMAIL_OAUTH_REFRESH_TOKEN") or "").strip()
+    if gmail_email and (gmail_password or gmail_refresh_token):
         accounts.append(
             build_account(
                 {
@@ -311,12 +353,17 @@ def accounts_from_env(environ: Optional[Mapping[str, str]] = None) -> List[MailA
                     "provider": "gmail",
                     "password": gmail_password,
                     "label": env.get("GMAIL_LABEL") or "Gmail",
+                    "client_id": (env.get("GMAIL_OAUTH_CLIENT_ID") or "").strip(),
+                    "client_secret": (env.get("GMAIL_OAUTH_CLIENT_SECRET") or "").strip(),
+                    "refresh_token": gmail_refresh_token,
+                    "oauth_token_url": env.get("GMAIL_OAUTH_TOKEN_URL"),
                 }
             )
         )
     elif gmail_email:
         _log.warning(
-            "GMAIL_EMAIL=%s set without GMAIL_APP_PASSWORD; mailbox skipped",
+            "GMAIL_EMAIL=%s set without GMAIL_OAUTH_REFRESH_TOKEN (OAuth sign-in) "
+            "or GMAIL_APP_PASSWORD; mailbox skipped",
             gmail_email,
         )
 

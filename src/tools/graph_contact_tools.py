@@ -18,8 +18,8 @@ from .mailbox_tools import RoutedMailTool
 
 
 def _require_contacts(account):
-    if account.kind not in {"graph", "imap"}:
-        raise MailBackendError("Contacts require Exchange, Graph, or a CardDAV-capable IMAP mailbox")
+    if account.kind not in {"graph", "imap", "jmap"}:
+        raise MailBackendError("Contacts require Exchange, Graph, or a CardDAV-capable IMAP/JMAP mailbox")
 
 
 def _require_graph(account):

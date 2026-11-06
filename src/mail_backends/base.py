@@ -296,6 +296,11 @@ class MailBackend(ABC):
     flag_statuses: Tuple[str, ...] = ("NotFlagged", "Flagged")
     #: whether :meth:`search_all_folders` is implemented
     supports_all_folder_search: bool = False
+    #: optional keyword criteria :meth:`search_messages` and
+    #: :meth:`search_all_folders` also accept: ``"to_address"`` (To header
+    #: text), ``"body"`` (body text) and ``"is_read"`` (True: read mail only,
+    #: False: unread only). The tools pass only the ones named here.
+    search_filters: Tuple[str, ...] = ()
 
     def __init__(self, email: str) -> None:
         self.email = email

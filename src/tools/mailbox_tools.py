@@ -132,7 +132,7 @@ ROUTED_TOOL_NAMES = (
 
 _MAILBOX_DESC = (
     "Mailbox to operate on. Any configured mailbox address (call "
-    "list_mailboxes) — Exchange, iCloud/IMAP and Outlook/Graph are routed "
+    "list_mailboxes) — Exchange, iCloud/IMAP, Outlook/Graph and JMAP are routed "
     "automatically — or another Exchange mailbox you have impersonation / "
     "delegate access to. Default: the primary mailbox. Alias: 'mailbox'."
 )
@@ -141,7 +141,7 @@ _FOLDER_DESC = (
     "For IMAP, the folder containing this message ID (default inbox): "
     + ", ".join(WELL_KNOWN_FOLDERS) + " or the native id/path from list_folders. "
     "Supply the actual folder for messages outside inbox. "
-    "Exchange and Graph address the message by ID."
+    "Exchange, Graph and JMAP address the message by ID."
 )
 
 _OFFSET_DESC = (
@@ -352,7 +352,8 @@ class ListMailboxesTool(BaseTool):
             "description": (
                 "List every configured mailbox with the protocol serving it "
                 "(ews = Exchange/SmarterMail, imap = iCloud or generic IMAP, "
-                "graph = Outlook.com / Microsoft 365). Pass "
+                "graph = Outlook.com / Microsoft 365, jmap = Fastmail, Stalwart "
+                "or generic JMAP). Pass "
                 "test_connection=true to authenticate each one. Start here, "
                 "then pass 'target_mailbox' to any mail tool."
             ),
@@ -381,8 +382,8 @@ class ListMailboxesTool(BaseTool):
             info["capabilities"] = {
                 "drafts_create": True,
                 "update_draft": True,
-                "calendar": kind in ("ews", "graph") or (kind == "imap" and has_caldav),
-                "contacts": kind in ("ews", "graph") or (kind == "imap" and has_carddav),
+                "calendar": kind in ("ews", "graph") or (kind in ("imap", "jmap") and has_caldav),
+                "contacts": kind in ("ews", "graph") or (kind in ("imap", "jmap") and has_carddav),
                 "schedule": schedule,
                 "files": True,
                 "folder_scoped_ids": kind == "imap",
@@ -404,6 +405,22 @@ class ListMailboxesTool(BaseTool):
                     )
                 else:
                     hints["calendar_contacts"] = "IMAP does not expose calendar/contacts; configure CalDAV/CardDAV URLs for provider-native support."
+            elif kind == "jmap":
+                hints["ids"] = (
+                    "JMAP message ids are mailbox-wide and survive moves, so folder is informational. "
+                    "Draft edits and attachment changes replace the draft: use the returned ID and attachment IDs."
+                )
+                if has_caldav or has_carddav:
+                    hints["calendar_contacts"] = (
+                        "CalDAV/CardDAV calendar and contacts use resource hrefs, VEVENT/VCARD UIDs and ETags; "
+                        "they never use JMAP ids. Event/contact CRUD is supported. Organization free/busy, "
+                        "meeting-time search and contact analytics are unavailable."
+                    )
+                else:
+                    hints["calendar_contacts"] = (
+                        "Calendar/contacts need caldav_url/carddav_url (basic auth with the account password; "
+                        "Fastmail needs an app password there, not the API token)."
+                    )
             if schedule:
                 hints["schedule"] = "Configured SmarterMail REST; requires native SmarterMail endpoint/credentials, not generic Exchange."
             else:
@@ -426,7 +443,7 @@ class ListMailboxesTool(BaseTool):
                 "Exchange, attachment changes require a draft. send_email can "
                 "send an existing unchanged draft. Draft creation and partial updates "
                 "are routed too; use returned IDs and folders after edits. Calendar "
-                "and contact tools also support Graph and DAV-capable iCloud/IMAP "
+                "and contact tools also support Graph and DAV-capable iCloud/IMAP/JMAP "
                 "accounts, subject to provider credentials/scopes. Tasks, rules, "
                 "OOF and bulk/conversation reads remain Exchange-only. "
                 "SmarterMail REST extras, including scheduling "
@@ -506,6 +523,15 @@ class ReadEmailsTool(RoutedMailTool, _ExchangeReadEmailsTool):
         )
 
 
+#: Tool parameters served by each optional backend search filter
+#: (:attr:`MailBackend.search_filters`); without the filter they stay Exchange-only.
+_SEARCH_FILTER_PARAMS = {
+    "to_address": ("to_address", "recipient"),
+    "body": ("body_contains",),
+    "is_read": ("is_read",),
+}
+
+
 class SearchEmailsTool(RoutedMailTool, _ExchangeSearchEmailsTool):
     """search_emails for any mailbox (quick / full-text modes)."""
 
@@ -527,18 +553,23 @@ class SearchEmailsTool(RoutedMailTool, _ExchangeSearchEmailsTool):
         reject_other_mode_params(kwargs, mode)
         # Schema defaults (which some clients fill in) request nothing.
         explicit = {k: v for k, v in kwargs.items() if not search_param_is_default(k, v)}
+        served = {
+            param for name in backend.search_filters for param in _SEARCH_FILTER_PARAMS.get(name, ())
+        }
         self.reject_exchange_only(
             account,
             explicit,
-            (
-                "to_address",
-                "recipient",
-                "body_contains",
-                "categories",
-                "importance",
-                "is_flagged",
-                "search_in",
-                "exact_phrase",
+            tuple(
+                param for param in (
+                    "to_address",
+                    "recipient",
+                    "body_contains",
+                    "categories",
+                    "importance",
+                    "is_flagged",
+                    "search_in",
+                    "exact_phrase",
+                ) if param not in served
             ),
         )
         if "sort_by" in explicit or "sort_order" in explicit:
@@ -546,7 +577,7 @@ class SearchEmailsTool(RoutedMailTool, _ExchangeSearchEmailsTool):
                 f"sort_by / sort_order: not supported for {account.email} "
                 f"({account.provider}) — results are always newest-first."
             )
-        if kwargs.get("is_read") is True:
+        if kwargs.get("is_read") is True and "is_read" not in served:
             raise ValidationError(
                 f"is_read=true: not supported for {account.email} "
                 f"({account.provider} over {account.kind.upper()}) — only "
@@ -615,6 +646,12 @@ class SearchEmailsTool(RoutedMailTool, _ExchangeSearchEmailsTool):
             limit=limit + offset,
             flag_status=flag_status,
         )
+        extras = {
+            "to_address": kwargs.get("to_address") or kwargs.get("recipient") or None,
+            "body": kwargs.get("body_contains") or None,
+            "is_read": is_read,
+        }
+        criteria.update((name, extras[name]) for name in backend.search_filters if name in extras)
 
         response: Dict[str, Any] = {}
         if all_folders:
@@ -689,7 +726,7 @@ class SendEmailTool(RoutedMailTool, _ExchangeSendEmailTool):
         "folder": {
             "type": "string",
             "default": "drafts",
-            "description": "Drafts folder for IMAP draft_id sends; ignored by Exchange/Graph.",
+            "description": "Drafts folder for IMAP draft_id sends; ignored by Exchange/Graph/JMAP.",
         },
     }
 
@@ -919,8 +956,8 @@ class _RoutedDraftCreator(RoutedMailTool):
         schema = super().get_schema()
         schema["description"] = (
             schema["description"].replace("Exchange-only ", "")
-            + " Supported on Exchange, Graph and IMAP. Use returned IDs and folder "
-            "for edits or sending; IMAP edits replace IDs."
+            + " Supported on Exchange, Graph, IMAP and JMAP. Use returned IDs and folder "
+            "for edits or sending; IMAP and JMAP edits replace IDs."
         )
         return schema
 
@@ -1128,8 +1165,8 @@ class UpdateEmailTool(RoutedMailTool, _ExchangeUpdateEmailTool):
 # ----------------------------------------------------------------------
 _ATTACHMENT_FOLDER_DESC = _FOLDER_DESC
 _DRAFT_FOLDER_DESC = (
-    "Folder holding the draft (default: drafts). iCloud/IMAP and "
-    "Outlook/Graph only allow attachment changes on a draft."
+    "Folder holding the draft (default: drafts). iCloud/IMAP, "
+    "Outlook/Graph and JMAP only allow attachment changes on a draft."
 )
 
 

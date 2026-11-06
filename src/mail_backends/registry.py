@@ -171,6 +171,10 @@ class MailboxRegistry:
             from .graph_backend import GraphBackend
 
             return GraphBackend(account)
+        if kind == "jmap":
+            from .jmap_backend import JMAPBackend
+
+            return JMAPBackend(account)
         if kind == "ews":
             from .ews_backend import EWSBackend
 

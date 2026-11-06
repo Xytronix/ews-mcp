@@ -12,8 +12,8 @@ from ..mail_backends.graph_calendar import _datetime
 
 
 def _require_calendar(account):
-    if account.kind not in {"graph", "imap"}:
-        raise MailBackendError("Calendar operations require Exchange, Graph, or a CalDAV-capable IMAP mailbox")
+    if account.kind not in {"graph", "imap", "jmap"}:
+        raise MailBackendError("Calendar operations require Exchange, Graph, or a CalDAV-capable IMAP/JMAP mailbox")
 
 
 def _require_graph(account, operation):

@@ -14,6 +14,18 @@ Upstream's history follows from `[Unreleased]` on.
 - IMAP/SMTP mailbox backend with iCloud and Gmail presets and generic server
   settings. iCloud calendars and contacts use CalDAV/CardDAV with the
   app-specific password.
+- Gmail OAuth sign-in. An IMAP account with `client_id`, `client_secret` and
+  `refresh_token` (or the `GMAIL_OAUTH_*` variables) signs in to IMAP and SMTP
+  with XOAUTH2 instead of an app password. The server refreshes the access
+  token itself and retries a refused cached token once.
+  `python -m src.mail_backends.google_oauth` gets the refresh token with
+  PKCE, through a loopback listener or by pasting the redirect address.
+- JMAP mailbox backend (RFC 8620/8621) for Fastmail, Stalwart and other JMAP
+  servers, with providers `jmap`, `fastmail` and `stalwart`, `session_url`,
+  and Bearer `api_token` or Basic auth. Mail, search (including all folders,
+  recipient, body text and read mail), drafts, attachments, reply, forward and
+  sending through `EmailSubmission` route through it. Calendars and contacts
+  use CalDAV/CardDAV when `caldav_url` or `carddav_url` is set.
 - Multi-mailbox accounts from `MAIL_ACCOUNTS`, the `ICLOUD_*`, `GMAIL_*` and
   `OUTLOOK_*` variables, or a Supabase table (`SUPABASE_URL`,
   `SUPABASE_SERVICE_KEY`, `EWS_ACCOUNTS_TABLE`). Exchange rows in the table

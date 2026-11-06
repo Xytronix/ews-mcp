@@ -1,8 +1,10 @@
 """IMAP + SMTP mailbox backend.
 
 Serves iCloud Mail (``imap.mail.me.com`` / ``smtp.mail.me.com``, app-specific
-password) and any other plain IMAP4rev1 + SMTP server. Uses only the stdlib
-(``imaplib``, ``smtplib``, ``email``) — no new dependencies.
+password) and any other plain IMAP4rev1 + SMTP server. Accounts with an OAuth
+``refresh_token`` (Gmail) sign in with SASL XOAUTH2 instead (see
+``google_oauth``). Uses only the stdlib (``imaplib``, ``smtplib``, ``email``)
+plus httpx for the token refresh.
 
 Notes on the protocol choices:
 
@@ -33,12 +35,13 @@ from email.header import decode_header, make_header
 from email.message import EmailMessage, Message
 from functools import wraps
 from html import escape, unescape
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..body_format import compose_body, render_body
 from ..utils import outbound_tracking_header
 from .accounts import MailAccount
 from .dav import DAVMixin
+from .google_oauth import OAuthTokenSource, sign_in_hint, xoauth2_string
 from .base import (
     MailAttachmentContent,
     MailAttachmentInfo,
@@ -248,6 +251,8 @@ class IMAPBackend(DAVMixin, MailBackend):
         self._selected_readonly = True
         self._folders: Optional[List[MailFolder]] = None
         self._delimiter = "/"
+        # Set when the account signs in with XOAUTH2 instead of a password.
+        self._oauth = OAuthTokenSource(account) if account.uses_oauth else None
 
     # ------------------------------------------------------------------
     # connection
@@ -277,7 +282,7 @@ class IMAPBackend(DAVMixin, MailBackend):
             if not host:
                 raise MailBackendError(f"{self.email}: no imap_host configured")
             password = self.account.password
-            if not password:
+            if self._oauth is None and not password:
                 raise MailBackendError(f"{self.email}: no IMAP password configured")
 
             try:
@@ -299,22 +304,70 @@ class IMAPBackend(DAVMixin, MailBackend):
                     f"cannot reach IMAP {host}:{port} for {self.email}: {exc}"
                 ) from exc
 
-            try:
-                conn.login(self._imap_username, password)
-            except imaplib.IMAP4.error as exc:
+            if self._oauth is not None:
+                self._imap_xoauth2(conn, host)
+            else:
                 try:
-                    conn.logout()
-                except Exception:
-                    pass
-                raise MailBackendError(
-                    f"IMAP login failed for {self.email} on {host}: {exc}. "
-                    f"iCloud and Outlook require an app-specific password, not the "
-                    f"account password."
-                ) from exc
+                    conn.login(self._imap_username, password)
+                except imaplib.IMAP4.error as exc:
+                    try:
+                        conn.logout()
+                    except Exception:
+                        pass
+                    raise MailBackendError(
+                        f"IMAP login failed for {self.email} on {host}: {exc}. "
+                        f"iCloud and Outlook require an app-specific password, not the "
+                        f"account password."
+                    ) from exc
 
             self._imap = conn
             self._selected = None
             return conn
+
+    def _xoauth2_sign_in(
+        self, user: str, attempt: Callable[[str], Any], rejected: type,
+    ) -> None:
+        """Run ``attempt`` with an XOAUTH2 response; renew a refused cached token once."""
+        token, cached = self._oauth.access_token()
+        try:
+            attempt(xoauth2_string(user, token))
+            return
+        except rejected:
+            if not cached:
+                raise
+        attempt(xoauth2_string(user, self._oauth.renew(token)))
+
+    def _xoauth2_refused(self, protocol: str, where: str, user: str, exc: Exception) -> str:
+        return (
+            f"{protocol} XOAUTH2 sign-in failed for {self.email} on {where}: {exc}. "
+            f"The server refused a freshly refreshed access token for user {user!r}: "
+            f"check that the refresh token was granted the https://mail.google.com/ "
+            f"scope for this address, or sign in again with {sign_in_hint(self.email)}."
+        )
+
+    def _imap_xoauth2(self, conn: imaplib.IMAP4, host: str) -> None:
+        def attempt(sasl: str) -> None:
+            try:
+                # An error challenge (non-empty) must be answered with an empty line.
+                conn.authenticate("XOAUTH2", lambda challenge: b"" if challenge else sasl.encode())
+            except imaplib.IMAP4.abort as exc:
+                raise MailBackendError(
+                    f"IMAP {host} closed the connection during XOAUTH2 sign-in "
+                    f"for {self.email}: {exc}"
+                ) from exc
+
+        try:
+            self._xoauth2_sign_in(self._imap_username, attempt, imaplib.IMAP4.error)
+        except (imaplib.IMAP4.error, MailBackendError) as exc:
+            try:
+                conn.logout()
+            except Exception:
+                pass
+            if isinstance(exc, MailBackendError):
+                raise
+            raise MailBackendError(
+                self._xoauth2_refused("IMAP", host, self._imap_username, exc)
+            ) from exc
 
     def _drop_connection(self) -> None:
         conn, self._imap = self._imap, None
@@ -1933,7 +1986,7 @@ class IMAPBackend(DAVMixin, MailBackend):
         password = self.account.password
         if not host:
             raise MailBackendError(f"{self.email}: no smtp_host configured")
-        if not password:
+        if self._oauth is None and not password:
             raise MailBackendError(f"{self.email}: no SMTP password configured")
 
         context = ssl.create_default_context()
@@ -1941,7 +1994,7 @@ class IMAPBackend(DAVMixin, MailBackend):
         try:
             if self.account.get("smtp_ssl"):
                 with smtplib.SMTP_SSL(host, port, timeout=60, context=context) as smtp:
-                    smtp.login(username, password)
+                    self._smtp_sign_in(smtp, username, password)
                     refused = (
                         smtp.sendmail(self.email, list(envelope), outgoing)
                         if isinstance(outgoing, bytes)
@@ -1953,13 +2006,17 @@ class IMAPBackend(DAVMixin, MailBackend):
                     if self.account.get("smtp_starttls", True):
                         smtp.starttls(context=context)
                         smtp.ehlo()
-                    smtp.login(username, password)
+                    self._smtp_sign_in(smtp, username, password)
                     refused = (
                         smtp.sendmail(self.email, list(envelope), outgoing)
                         if isinstance(outgoing, bytes)
                         else smtp.send_message(outgoing, to_addrs=list(envelope))
                     )
         except smtplib.SMTPAuthenticationError as exc:
+            if self._oauth is not None:
+                raise MailBackendError(
+                    self._xoauth2_refused("SMTP", f"{host}:{port}", username, exc)
+                ) from exc
             raise MailBackendError(
                 f"SMTP login failed for {self.email} on {host}:{port}: {exc}. "
                 f"iCloud requires an app-specific password."
@@ -1973,6 +2030,21 @@ class IMAPBackend(DAVMixin, MailBackend):
                 f"SMTP send failed for {self.email} via {host}:{port}: {exc}"
             ) from exc
         return refused
+
+    def _smtp_sign_in(self, smtp: smtplib.SMTP, username: str, password: Optional[str]) -> None:
+        if self._oauth is None:
+            smtp.login(username, password)
+            return
+        smtp.ehlo_or_helo_if_needed()
+        self._xoauth2_sign_in(
+            username,
+            # smtplib asks for the initial response first, then answers each 334
+            # challenge; an error challenge must get an empty reply.
+            lambda sasl: smtp.auth(
+                "XOAUTH2", lambda challenge=None: sasl if challenge is None else ""
+            ),
+            smtplib.SMTPAuthenticationError,
+        )
 
     @_mailbox_operation
     def _append_to_sent(self, outgoing: EmailMessage | bytes) -> Optional[str]:

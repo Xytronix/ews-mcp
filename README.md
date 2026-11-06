@@ -9,10 +9,12 @@ mailbox over EWS. The fork extends upstream's 4.0 server in [`src/`](src/) and
 keeps its tool names. It adds:
 
 - **More mailbox backends behind the same tools.** Microsoft Graph serves
-  Outlook.com and Microsoft 365 mailboxes. IMAP/SMTP serves iCloud, Gmail and
-  generic IMAP servers. iCloud CalDAV/CardDAV serves iCloud calendars and
-  contacts. Mail, draft and attachment tools route to every backend, and the
-  core calendar and contact tools route to Graph and iCloud.
+  Outlook.com and Microsoft 365 mailboxes. IMAP/SMTP serves iCloud, Gmail
+  (app password or OAuth sign-in) and generic IMAP servers. JMAP serves
+  Fastmail, Stalwart and other JMAP servers. CalDAV/CardDAV serves iCloud
+  calendars and contacts, and those of IMAP and JMAP accounts that set DAV
+  URLs. Mail, draft and attachment tools route to every backend, and the core
+  calendar and contact tools route to Graph and DAV.
 - **Multi-mailbox accounts.** Accounts come from the `MAIL_ACCOUNTS`
   environment variable, single-account convenience variables or a Supabase
   table. `list_mailboxes` lists them with their capabilities, and
@@ -148,7 +150,9 @@ Source `env` means it is read from the process environment only.
 | `ICLOUD_LABEL` | unset | env | Display label for the iCloud mailbox |
 | `ICLOUD_CALDAV_URL` | `https://caldav.icloud.com/` | env | CalDAV discovery root |
 | `ICLOUD_CARDDAV_URL` | `https://contacts.icloud.com/` | env | CardDAV discovery root |
-| `GMAIL_EMAIL` | unset | env | Adds a Gmail mailbox over IMAP/SMTP. Skipped without `GMAIL_APP_PASSWORD` |
+| `GMAIL_EMAIL` | unset | env | Adds a Gmail mailbox over IMAP/SMTP. Skipped without `GMAIL_OAUTH_REFRESH_TOKEN` or `GMAIL_APP_PASSWORD` |
+| `GMAIL_OAUTH_CLIENT_ID`, `GMAIL_OAUTH_CLIENT_SECRET`, `GMAIL_OAUTH_REFRESH_TOKEN` | unset | env | OAuth sign-in (XOAUTH2) instead of an app password, see [Gmail OAuth sign-in](#gmail-oauth-sign-in). With both set, OAuth is used |
+| `GMAIL_OAUTH_TOKEN_URL` | `https://oauth2.googleapis.com/token` | env | Token endpoint for the refresh |
 | `GMAIL_APP_PASSWORD` | unset | env | Google app password. Spaces are removed |
 | `GMAIL_LABEL` | `Gmail` | env | Display label for the Gmail mailbox |
 | `OUTLOOK_EMAIL` | unset | env | Adds an Outlook.com or Microsoft 365 mailbox over Graph |
@@ -199,14 +203,17 @@ optional `label` and connection keys either at the top level or inside a
 `imap_username`, `smtp_host`, `smtp_port` (587), `smtp_starttls` (true),
 `smtp_ssl` (false), `smtp_username`, `sent_folder`, `caldav_url`,
 `carddav_url`, `client_id`, `client_secret`, `tenant_id`, `refresh_token`,
-`graph_base_url`, `graph_token_url`, `graph_scope` and `shared_mailbox`.
+`oauth_token_url`, `graph_base_url`, `graph_token_url`, `graph_scope`,
+`shared_mailbox`, `session_url`, `api_token` and `jmap_username`.
 
 | `provider` | Backend | Preset or requirement |
 |---|---|---|
 | `icloud`, `apple` | IMAP/SMTP plus CalDAV/CardDAV | `imap.mail.me.com:993` SSL, `smtp.mail.me.com:587` STARTTLS, iCloud DAV roots |
-| `gmail`, `google` | IMAP/SMTP | `imap.gmail.com:993` SSL, `smtp.gmail.com:587` STARTTLS |
-| `imap` | IMAP/SMTP | none, set `imap_host` and `smtp_host` |
+| `gmail`, `google` | IMAP/SMTP | `imap.gmail.com:993` SSL, `smtp.gmail.com:587` STARTTLS. An app password, or `client_id`, `client_secret` and `refresh_token` for OAuth |
+| `imap` | IMAP/SMTP | none, set `imap_host` and `smtp_host`. A `refresh_token` with `client_id` and `oauth_token_url` signs in with XOAUTH2 |
 | `outlook`, `graph`, `office365`, `o365`, `m365`, `microsoft365` | Microsoft Graph | needs `client_id` plus `refresh_token` or `client_secret` |
+| `jmap`, `stalwart` | JMAP | set `session_url` (the session resource or `https://host/.well-known/jmap`), plus `api_token` (Bearer) or `password` (Basic, user `jmap_username` or the address) |
+| `fastmail` | JMAP | `https://api.fastmail.com/jmap/session`, set `api_token`. Fastmail DAV needs an app password as `password` |
 | `ews`, `exchange`, `smartermail` | Exchange (EWS) on the primary server | own passwords only from Supabase table rows, see below |
 
 The Supabase table is read once at startup over the Supabase REST API with
@@ -218,6 +225,40 @@ passwords, and they are the only way to do so. Without such a row,
 `target_mailbox` on Exchange needs impersonation or delegate access
 (`EWS_IMPERSONATION_ENABLED=true`, see
 [`docs/legacy/IMPERSONATION.md`](docs/legacy/IMPERSONATION.md)).
+
+### Gmail OAuth sign-in
+
+Gmail accepts an app password or OAuth 2.0. With a `refresh_token`, IMAP and
+SMTP sign in with XOAUTH2 and the server refreshes the access token itself, so
+no other service is involved. You need a Google Cloud OAuth client (Desktop
+app, or Web app with a registered redirect URI) and the restricted
+`https://mail.google.com/` scope on its consent screen.
+
+Get a refresh token once with the sign-in command. It opens a consent URL with
+PKCE and prints the refresh token, the `GMAIL_OAUTH_*` lines and a
+`MAIL_ACCOUNTS` entry:
+
+```bash
+python -m src.mail_backends.google_oauth --email you@gmail.com \
+  --client-id ID.apps.googleusercontent.com --client-secret SECRET --no-listen
+```
+
+- Without `--no-listen`, a listener on `127.0.0.1` catches the redirect. That
+  works only when the browser runs on the same machine.
+- With `--no-listen`, open the URL anywhere and paste the address the browser
+  was sent to (an error page there is fine) or the bare code. Use this inside
+  the container (`docker exec -it <container> python -m ...`).
+- A Web-app client needs `--redirect-uri` with a URI registered on it, for
+  example `http://localhost:8000/oauth2callback`.
+- `--auth-url`, `--token-url` and `--scope` point the command at another
+  OAuth server.
+
+Google limits: an app in Testing status issues refresh tokens that expire
+after 7 days, and only its listed test users can consent. Revoking access at
+https://myaccount.google.com/permissions or a password change also ends the
+token. The server then fails with `invalid_grant` and names the command to
+run again. OAuth accounts have no password, so CalDAV/CardDAV is not available
+for them.
 
 ## Tool surface
 
@@ -278,20 +319,21 @@ Support is per operation, not full Exchange parity. Use `list_mailboxes` to see
 each configured account and its `capabilities`, and pass `target_mailbox` (or
 its alias `mailbox`) to select one. Omitting it uses the primary mailbox.
 
-| Capability | Exchange | Graph | IMAP/SMTP |
-|---|---|---|---|
-| Folders, read, search, details, move, delete | Yes | Yes | Yes. IDs are folder-scoped |
-| Send, reply, forward with `files` and send a saved draft | Yes | Yes. New `files` up to 3 MiB in total | Yes. SMTP acceptance is not delivery |
-| Create compose, reply and forward drafts and `update_draft` | Yes | Yes | Yes. Edits rewrite the message and change IDs |
-| Attachments and raw MIME | Yes | Yes. Changes only on drafts | Yes. Changes only in Drafts |
-| Calendar event CRUD | Yes | Yes, with calendar consent | iCloud through CalDAV |
-| Recurring series and reminders | Yes. Occurrence vs `scope="series"` guard | Yes | Reminders yes; creating a series is refused |
-| Whole-mailbox search (`search_scope=["all"]`) | Advanced and full_text | Quick and full_text | No |
-| Follow-up flag state (`flag_status`) | NotFlagged, Flagged, Complete | NotFlagged, Flagged, Complete | Flagged and NotFlagged only |
-| Free/busy and meeting-time suggestions | Yes | Organization accounts only | No |
-| Contact CRUD and `find_person` | Yes, including GAL and mail history | Contacts only, with contact consent | iCloud through CardDAV, contacts only |
-| Tasks, `analyze_contacts` and other EWS-only tools | Yes | No | No |
-| Scheduled send and undo | SmarterMail REST tools only | No | No |
+| Capability | Exchange | Graph | IMAP/SMTP | JMAP |
+|---|---|---|---|---|
+| Folders, read, search, details, move, delete | Yes | Yes | Yes. IDs are folder-scoped | Yes. IDs are mailbox-wide and survive moves |
+| Send, reply, forward with `files` and send a saved draft | Yes | Yes. New `files` up to 3 MiB in total | Yes. SMTP acceptance is not delivery | Yes, through `EmailSubmission`. Acceptance is not delivery |
+| Create compose, reply and forward drafts and `update_draft` | Yes | Yes | Yes. Edits rewrite the message and change IDs | Yes. Edits replace the draft and change IDs |
+| Attachments and raw MIME | Yes | Yes. Changes only on drafts | Yes. Changes only in Drafts | Yes. Changes only on drafts |
+| Search by recipient, body text or read mail (`is_read=true`) | Yes | No | No | Yes |
+| Calendar event CRUD | Yes | Yes, with calendar consent | iCloud, or any account with `caldav_url`, through CalDAV | With `caldav_url`, through CalDAV |
+| Recurring series and reminders | Yes. Occurrence vs `scope="series"` guard | Yes | Reminders yes; creating a series is refused | Same as IMAP |
+| Whole-mailbox search (`search_scope=["all"]`) | Advanced and full_text | Quick and full_text | No | Quick and full_text |
+| Follow-up flag state (`flag_status`) | NotFlagged, Flagged, Complete | NotFlagged, Flagged, Complete | Flagged and NotFlagged only | Flagged and NotFlagged only |
+| Free/busy and meeting-time suggestions | Yes | Organization accounts only | No | No |
+| Contact CRUD and `find_person` | Yes, including GAL and mail history | Contacts only, with contact consent | Through CardDAV, contacts only | With `carddav_url`, through CardDAV |
+| Tasks, `analyze_contacts` and other EWS-only tools | Yes | No | No | No |
+| Scheduled send and undo | SmarterMail REST tools only | No | No | No |
 
 - For IMAP messages outside Inbox, pass the source `folder`. Keep the
   mailbox, folder and current message ID together, and use the fresh IDs a
