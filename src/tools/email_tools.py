@@ -1319,6 +1319,20 @@ class ReadEmailsTool(BaseTool):
                         "description": "Email address to read from (requires impersonation/delegate access)"
                     },
                     **READ_FORMAT_SCHEMA,
+                    # A listing carries previews only unless the caller asks
+                    # for bodies: 50 full bodies per call would swamp the
+                    # agent's context.
+                    "include_body": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "When true, add each message's full body next to "
+                            "its 200-character preview, rendered per 'format' "
+                            "and 'trim_quoted'. Exchange mailboxes only; Graph "
+                            "and IMAP listings return previews, so use "
+                            "get_email_details for a body there."
+                        ),
+                    },
                 }
             }
         }
@@ -1329,10 +1343,9 @@ class ReadEmailsTool(BaseTool):
         max_results = kwargs.get("max_results", 50)
         unread_only = kwargs.get("unread_only", False)
         target_mailbox = kwargs.get("target_mailbox")
-        # v4.0: format/include_body affect the per-item shape. Backward
-        # compatible — defaults match v3.4 (preview only, no full body).
-        fmt = kwargs.get("format") or "html"
-        # Body only on explicit opt-in (preview-only default, as in v3.4).
+        # Preview-only by default; format/trim_quoted shape the opt-in body.
+        fmt = kwargs.get("format") or DEFAULT_READ_FORMAT
+        do_trim_quoted = bool(kwargs.get("trim_quoted", False))
         include_body = kwargs.get("include_body") is True
 
         try:
@@ -1380,6 +1393,8 @@ class ReadEmailsTool(BaseTool):
                         body_value, body_fmt = render_body(html_raw, text_body, fmt)
                     except ValueError:
                         body_value, body_fmt = text_body, "text"
+                    if do_trim_quoted and body_fmt in ("markdown", "text"):
+                        body_value = _trim_quoted_body(body_value)
                     email_data["body"] = body_value or text_body
                     email_data["body_format"] = body_fmt
                 emails.append(email_data)

@@ -96,7 +96,7 @@ delivery semantics, GAL/history/domain search, communication statistics and
 
 `get_email_details` defaults to `format=markdown`. Pass `format=html` for the
 HTML body. `read_emails` returns previews unless `include_body=true`
-(Exchange), and that body defaults to `html`. Compose, reply, forward and
+(Exchange), and that body also defaults to `markdown`. Compose, reply, forward and
 draft-creation tools default to `body_format=html`, and `update_draft`
 defaults to `body_format=markdown`. On write, opt in to `markdown` or `text`
 for server-side conversion, and specify the format explicitly when editing a
@@ -291,7 +291,8 @@ body) by default — use `get_email_details` for the full message.
 | `folder` | `string` | `"inbox"` | standard name (`inbox` / `sent` / `drafts` / `deleted` / `junk`) or path (`Inbox/Projects`) or folder ID |
 | `max_results` | `int` | 50 | max 1000 |
 | `unread_only` | `bool` | false | |
-| `format` | `"html"\|"markdown"\|"text"` | `html` | body format when `include_body=true` (Exchange) |
+| `format` | `"html"\|"markdown"\|"text"` | `markdown` | body format when `include_body=true` (Exchange) |
+| `trim_quoted` | `bool` | false | strips `On …, X wrote:` thread history from that body (Exchange) |
 | `include_body` | `bool` | false | Exchange: add the full `body` and `body_format` beside the preview. Graph/IMAP ignore it |
 
 ### `search_emails`

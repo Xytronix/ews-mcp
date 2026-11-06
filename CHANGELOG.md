@@ -67,7 +67,8 @@ Upstream's history follows from `[Unreleased]` on.
   streamable-http as well as sse.
 - `RATE_LIMIT_REQUESTS_PER_MINUTE` defaults to 120 instead of 25.
 - `get_email_details` defaults to `format=markdown`. On Exchange, `read_emails`
-  adds the full body only with `include_body=true` (html by default).
+  adds the full body only with `include_body=true` (markdown by default,
+  `trim_quoted` honoured), and its schema now states that default.
   `read_attachment` returns 8000 characters per call by default. Base64
   `download_attachment` and `get_email_mime` refuse more than 64 KiB unless
   `max_bytes` is raised.

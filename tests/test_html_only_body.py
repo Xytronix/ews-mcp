@@ -99,6 +99,29 @@ def test_read_emails_include_body_html_only(monkeypatch):
     assert "body" not in res["emails"][0] and res["emails"][0]["preview"]
 
 
+def test_read_emails_defaults_match_its_schema(monkeypatch):
+    reply = SimpleNamespace(**{**vars(_item()), "body": (
+        "<p>New answer</p><p>On Mon, Jan 5, 2026 at 10:00 AM Bob wrote:</p>"
+        "<blockquote>old text</blockquote>")})
+
+    class _QS(list):
+        def order_by(self, *_):
+            return self
+
+    async def _resolve(*_a, **_k):
+        return SimpleNamespace(name="Inbox", all=lambda: _QS([reply]))
+    monkeypatch.setattr(email_mod, "resolve_folder_for_account", _resolve)
+    tool = ReadEmailsTool(_Client())
+    props = tool.get_schema()["inputSchema"]["properties"]
+
+    listed = asyncio.run(tool.execute())["emails"][0]
+    assert ("body" in listed) is props["include_body"]["default"]
+    body = asyncio.run(tool.execute(include_body=True))["emails"][0]
+    assert body["body_format"] == props["format"]["default"]
+    trimmed = asyncio.run(tool.execute(include_body=True, trim_quoted=True))["emails"][0]
+    assert "New answer" in trimmed["body"] and "old text" not in trimmed["body"]
+
+
 def test_markdown_strips_css_head_and_comments():
     html = ("<!doctype html><html><head><title>T</title>"
             "<style>#outlook a { padding:0; } body { margin:0; }</style></head>"
