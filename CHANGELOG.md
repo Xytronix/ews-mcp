@@ -49,6 +49,19 @@ Upstream's history follows from `[Unreleased]` on.
   and retries `ErrorServerBusy` and HTTP 429 with exponential backoff
   (`EWS_THROTTLE_MAX_RETRIES`, `EWS_THROTTLE_BASE_DELAY`,
   `EWS_THROTTLE_MAX_DELAY`).
+- Recurring calendar series on Exchange and Graph: `create_appointment`
+  takes a `recurrence` object (daily, weekly, monthly, yearly; interval;
+  until or count) that keeps its wall-clock time across DST. `get_calendar`
+  reports `type`, `series_master_id`, `reminder_minutes` and, on request, the
+  rule. Update and delete act on one occurrence unless `scope="series"`, and a
+  series master id is refused without it. CalDAV refuses creating a series.
+- Reminders: `reminder_minutes` is set, changed or cleared (`null`) on create
+  and update across Exchange, Graph and CalDAV (VALARM).
+- `reply_email` takes `cc` and `bcc` on Exchange, Graph and IMAP.
+- `search_emails`: `search_scope=["all"]` searches every mail folder and
+  merges one sorted page (`EWS_SEARCH_ALL_MAX_FOLDERS`, default 50); a
+  `flag_status` filter (`NotFlagged`, `Flagged`, `Complete`); and
+  `flag_status` in search, `read_emails` and `get_email_details` results.
 - A test suite in `tests/`.
 
 ### Changed
@@ -138,6 +151,27 @@ Upstream's history follows from `[Unreleased]` on.
   and say "not verified" when that part is unavailable. Encrypted `.p7m`
   (CMS envelopedData/authEnvelopedData) is reported as encrypted instead of
   failing with "No certificates found".
+- full_text `exact_phrase` matches inside one field instead of across the
+  subject/body join, and `search_in=["attachments"]` searches attachment
+  file names instead of silently skipping every folder.
+- Calendar: Graph `reminder_minutes=null` turns the reminder off instead of
+  falling back to Graph's default, Graph no longer drops a recurrence
+  silently, CalDAV writes the reminder it was given, and a CalDAV update keeps
+  attendees, alarms and the RRULE instead of rebuilding the event. Updating
+  or deleting an Exchange series master needs `scope="series"`.
+- `update_appointment` on Exchange refuses a call that changes nothing
+  instead of rewriting every field, and an attachment-only update adds the
+  files without rewriting the item (it sends no meeting update).
+- `search_emails` no longer narrows or drops input silently: `search_scope`
+  accepts folder paths, names or IDs in every mode and refuses unknown ones,
+  a folder listed twice is searched once, full_text applies the quick
+  filters, `to_address` matches the To list (exchangelib cannot restrict on
+  it, so it used to return nothing), unparseable dates are refused, and a
+  string `cc`/`bcc` on `create_reply_draft` is read as addresses.
+- `search_emails` refuses a parameter that belongs to another mode, an
+  unknown `mode` or sort value, and (on Graph/IMAP) `is_read=true` and
+  `keywords`, instead of ignoring them. Quick mode honours `sort_by` and
+  `sort_order`, and advanced mode applies the `sender`/`recipient` aliases.
 
 ### Remote-agent attachments (2026-09-24)
 

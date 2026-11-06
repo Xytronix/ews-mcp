@@ -173,6 +173,7 @@ Source `env` means it is read from the process environment only.
 | `EWS_THROTTLE_BASE_DELAY` | `3` | env | First backoff delay in seconds, doubled on each retry |
 | `EWS_THROTTLE_MAX_DELAY` | `30` | env | Longest backoff delay in seconds |
 | `OUTBOUND_TRACKING_HEADER` | unset (off) | env | Header name that carries a per-message tracking ID on fresh outbound mail, for example `X-Mail-Tracking-ID`. Recipients can see it. Unset or empty adds no header, and sends report `tracking_id: null` |
+| `EWS_SEARCH_ALL_MAX_FOLDERS` | `50` | env | Most mail folders `search_scope=["all"]` searches on Exchange. A mailbox with more fails with a clear error |
 
 ### Mailbox accounts
 
@@ -282,6 +283,9 @@ its alias `mailbox`) to select one. Omitting it uses the primary mailbox.
 | Create compose, reply and forward drafts and `update_draft` | Yes | Yes | Yes. Edits rewrite the message and change IDs |
 | Attachments and raw MIME | Yes | Yes. Changes only on drafts | Yes. Changes only in Drafts |
 | Calendar event CRUD | Yes | Yes, with calendar consent | iCloud through CalDAV |
+| Recurring series and reminders | Yes. Occurrence vs `scope="series"` guard | Yes | Reminders yes; creating a series is refused |
+| Whole-mailbox search (`search_scope=["all"]`) | Advanced and full_text | Quick and full_text | No |
+| Follow-up flag state (`flag_status`) | NotFlagged, Flagged, Complete | NotFlagged, Flagged, Complete | Flagged and NotFlagged only |
 | Free/busy and meeting-time suggestions | Yes | Organization accounts only | No |
 | Contact CRUD and `find_person` | Yes, including GAL and mail history | Contacts only, with contact consent | iCloud through CardDAV, contacts only |
 | Tasks, `analyze_contacts` and other EWS-only tools | Yes | No | No |

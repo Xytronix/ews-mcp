@@ -6,7 +6,7 @@ import logging
 import re
 import time
 import urllib.parse
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import httpx
 
@@ -14,6 +14,7 @@ from ..body_format import compose_body, render_body
 from ..utils import outbound_tracking_header
 from .accounts import MailAccount
 from .base import (
+    ALL_FOLDERS_EXCLUDED,
     MailAttachmentContent,
     MailAttachmentInfo,
     MailBackend,
@@ -67,6 +68,13 @@ _MSG_SELECT = (
     "hasAttachments,bodyPreview,importance,conversationId,internetMessageId,flag"
 )
 _MSG_GET_SELECT = _MSG_SELECT + ",body,ccRecipients,bccRecipients,replyTo"
+_RECIPIENT_FIELDS = ("toRecipients", "ccRecipients", "bccRecipients")
+
+# Graph ``flag.flagStatus`` in the Exchange vocabulary the tools report.
+_FLAG_STATUS_NAMES = {"notflagged": "NotFlagged", "flagged": "Flagged", "complete": "Complete"}
+
+# Well-known Graph folder names of the folders a whole-mailbox search skips.
+_EXCLUDABLE_GRAPH = {**_WELL_KNOWN_GRAPH, "outbox": "outbox"}
 
 # Graph folder ids are long opaque tokens (typically 40+ chars, no whitespace/slash).
 _GRAPH_ID_RE = re.compile(r"^[A-Za-z0-9+/=_-]{20,}$")
@@ -116,6 +124,8 @@ def _graph_remedy(status: int, code: Optional[str]) -> str:
 
 class GraphBackend(GraphCalendarMixin, GraphContactsMixin, MailBackend):
     kind = "graph"
+    flag_statuses = ("NotFlagged", "Flagged", "Complete")
+    supports_all_folder_search = True
 
     def __init__(self, account: MailAccount) -> None:
         super().__init__(account.email)
@@ -447,10 +457,15 @@ class GraphBackend(GraphCalendarMixin, GraphContactsMixin, MailBackend):
         return out
 
     def _is_flagged(self, item: dict) -> bool:
-        flag = item.get("flag") or {}
-        if isinstance(flag, dict):
-            return str(flag.get("flagStatus") or "").lower() == "flagged"
-        return False
+        return self._flag_status(item) == "Flagged"
+
+    @staticmethod
+    def _flag_status(item: dict) -> Optional[str]:
+        """``flag.flagStatus`` in the Exchange vocabulary, None when absent."""
+        flag = item.get("flag")
+        if not isinstance(flag, dict):
+            return None
+        return _FLAG_STATUS_NAMES.get(str(flag.get("flagStatus") or "notFlagged").lower())
 
     def _message_from_item(
         self,
@@ -489,6 +504,7 @@ class GraphBackend(GraphCalendarMixin, GraphContactsMixin, MailBackend):
             sent=item.get("sentDateTime"),
             is_read=bool(item.get("isRead")),
             is_flagged=self._is_flagged(item),
+            flag_status=self._flag_status(item),
             has_attachments=bool(item.get("hasAttachments")),
             importance=item.get("importance"),
             internet_message_id=item.get("internetMessageId"),
@@ -815,21 +831,132 @@ class GraphBackend(GraphCalendarMixin, GraphContactsMixin, MailBackend):
         unread_only: bool = False,
         has_attachments: Optional[bool] = None,
         limit: int = 25,
+        flag_status: Optional[str] = None,
     ) -> List[MailMessage]:
         fid = self._resolve_folder(folder)
-        prefix = self._resource_prefix()
-        params: Dict[str, Any] = {"$select": _MSG_SELECT}
-        use_search = bool(query)
-        # Two predicates cannot go to the server: $search takes no $filter at
-        # all, and "hasAttachments eq true" next to $orderby is refused with
-        # 400 InefficientFilter. Both are applied locally, which only keeps
-        # its recall if we over-fetch and keep following @odata.nextLink -
-        # a single $top=limit page silently returned a fraction of the hits.
-        post_filter = not use_search and has_attachments is not None
-        local_filter = use_search and any(
-            (from_address, subject, since, before, unread_only, has_attachments is not None)
+        rows = self._search_rows(
+            f"{self._resource_prefix()}/mailFolders/{urllib.parse.quote(fid, safe='')}/messages",
+            query=query, from_address=from_address, subject=subject, since=since,
+            before=before, unread_only=unread_only, has_attachments=has_attachments,
+            flag_status=flag_status, limit=limit,
         )
-        over_fetch = post_filter or local_filter
+        return [self._message_from_item(it, folder) for it in rows]
+
+    def search_all_folders(
+        self,
+        include: Sequence[str] = (),
+        query: Optional[str] = None,
+        from_address: Optional[str] = None,
+        subject: Optional[str] = None,
+        since: Optional[str] = None,
+        before: Optional[str] = None,
+        unread_only: bool = False,
+        has_attachments: Optional[bool] = None,
+        limit: int = 25,
+        flag_status: Optional[str] = None,
+    ) -> Tuple[List[MailMessage], List[str]]:
+        # One query on the mailbox-wide messages collection. It also holds
+        # Deleted Items, Junk, Drafts and Outbox, and messages in folders
+        # list_folders does not show, so only hits in the covered folders count.
+        paths = self._all_folder_paths(include)
+        rows = self._search_rows(
+            f"{self._resource_prefix()}/messages",
+            query=query, from_address=from_address, subject=subject, since=since,
+            before=before, unread_only=unread_only, has_attachments=has_attachments,
+            flag_status=flag_status, limit=limit,
+            keep=lambda it: it.get("parentFolderId") in paths,
+            select=_MSG_SELECT + ",parentFolderId",
+        )
+        messages = [self._message_from_item(it, paths[it["parentFolderId"]]) for it in rows]
+        return messages, list(paths.values())
+
+    def _all_folder_paths(self, include: Sequence[str]) -> Dict[str, str]:
+        """``{id: path}`` of every mail folder a whole-mailbox search covers.
+
+        Walks childFolders to any depth and skips each excluded well-known
+        folder together with its subtree.
+        """
+        prefix = self._resource_prefix()
+        excluded = set()
+        for alias in ALL_FOLDERS_EXCLUDED:
+            if alias in include:
+                continue
+            row = self._request(
+                "GET", f"{prefix}/mailFolders/{_EXCLUDABLE_GRAPH[alias]}",
+                params={"$select": "id"}, allow_404=True,
+            )
+            if row and row.get("id"):
+                excluded.add(str(row["id"]))
+        paths: Dict[str, str] = {}
+        pending = [(f"{prefix}/mailFolders", "")]
+        while pending:
+            url, parent_path = pending.pop(0)
+            rows = self._paginate(
+                url, params={"$top": "100", "$select": "id,displayName,childFolderCount"},
+            )
+            for row in rows:
+                fid = str(row.get("id") or "")
+                if not fid or fid in excluded:
+                    continue
+                name = row.get("displayName") or ""
+                path = f"{parent_path}/{name}" if parent_path else name
+                paths[fid] = path
+                if row.get("childFolderCount"):
+                    pending.append((
+                        f"{prefix}/mailFolders/{urllib.parse.quote(fid, safe='')}/childFolders",
+                        path,
+                    ))
+        return paths
+
+    def _search_rows(
+        self,
+        url: str,
+        *,
+        query: Optional[str],
+        from_address: Optional[str],
+        subject: Optional[str],
+        since: Optional[str],
+        before: Optional[str],
+        unread_only: bool,
+        has_attachments: Optional[bool],
+        flag_status: Optional[str],
+        limit: int,
+        keep: Optional[Any] = None,
+        select: str = _MSG_SELECT,
+    ) -> List[dict]:
+        params: Dict[str, Any] = {"$select": select}
+        use_search = bool(query)
+        # Some predicates cannot go to the server: $search takes no $filter at
+        # all, and "hasAttachments eq true" next to $orderby is refused with
+        # 400 InefficientFilter (a flag filter is kept local for the same
+        # reason). They are applied locally, which only keeps its recall if we
+        # over-fetch and keep following @odata.nextLink - a single $top=limit
+        # page silently returned a fraction of the hits.
+        search_criteria = use_search and any(
+            (from_address, subject, since, before, unread_only)
+        )
+
+        def matches(it: dict) -> bool:
+            if keep is not None and not keep(it):
+                return False
+            if flag_status and self._flag_status(it) != flag_status:
+                return False
+            if has_attachments is not None and bool(it.get("hasAttachments")) != has_attachments:
+                return False
+            return not search_criteria or self._client_match(
+                it,
+                from_address=from_address,
+                subject=subject,
+                since=since,
+                before=before,
+                unread_only=unread_only,
+                has_attachments=None,
+            )
+
+        over_fetch = (
+            search_criteria or keep is not None or bool(flag_status)
+            or has_attachments is not None
+        )
         params["$top"] = str(min(limit * 5, 200) if over_fetch else limit)
         if use_search:
             params["$search"] = f'"{query}"'
@@ -848,34 +975,19 @@ class GraphBackend(GraphCalendarMixin, GraphContactsMixin, MailBackend):
                 clauses.append("isRead eq false")
             if clauses:
                 params["$filter"] = " and ".join(clauses)
-        url = f"{prefix}/mailFolders/{urllib.parse.quote(fid, safe='')}/messages"
         request_params: Optional[Dict[str, Any]] = params
         items: List[dict] = []
         for _page in range(_MAX_SEARCH_PAGES):
             data = self._request("GET", url, params=request_params) or {}
             rows = data.get("value") or []
-            if local_filter:
-                rows = [
-                    it
-                    for it in rows
-                    if self._client_match(
-                        it,
-                        from_address=from_address,
-                        subject=subject,
-                        since=since,
-                        before=before,
-                        unread_only=unread_only,
-                        has_attachments=has_attachments,
-                    )
-                ]
-            elif post_filter:
-                rows = [it for it in rows if bool(it.get("hasAttachments")) == has_attachments]
+            if over_fetch:
+                rows = [it for it in rows if matches(it)]
             items.extend(rows)
             next_link = data.get("@odata.nextLink")
             if len(items) >= limit or not next_link:
                 break
             url, request_params = next_link, None
-        return [self._message_from_item(it, folder) for it in items[:limit]]
+        return items[:limit]
 
     def _draft_path(self, draft_id: str) -> str:
         return f"{self._resource_prefix()}/messages/{urllib.parse.quote(draft_id, safe='')}"
@@ -981,11 +1093,19 @@ class GraphBackend(GraphCalendarMixin, GraphContactsMixin, MailBackend):
         # Validate and encode all new files before creating anything remotely.
         files = self._file_attachment_payloads(message.attachments)
         prelude = compose_body(message.body, message.body_format)[0] if action else ""
+        reply = action in ("createReply", "createReplyAll")
         if action:
             inner: Dict[str, Any] = {}
-            for field, recipients in (("toRecipients", message.to),
-                                      ("ccRecipients", message.cc),
-                                      ("bccRecipients", message.bcc)):
+            # Graph replaces the recipients it derives for a reply with any
+            # list given here, which would drop the original Cc on reply-all.
+            # A reply therefore passes only an explicit To; its Cc and Bcc are
+            # added to the created draft below.
+            fields = (("toRecipients", message.to),) if reply else (
+                ("toRecipients", message.to),
+                ("ccRecipients", message.cc),
+                ("bccRecipients", message.bcc),
+            )
+            for field, recipients in fields:
                 if recipients or (field == "toRecipients" and action == "createForward"):
                     inner[field] = self._recipient_payloads(recipients)
             path = f"{self._draft_path(source_id or '')}/{action}"
@@ -1009,8 +1129,15 @@ class GraphBackend(GraphCalendarMixin, GraphContactsMixin, MailBackend):
                 None, "create", cleanup=message.cleanup_on_failure,
             )
         draft_path = self._draft_path(draft_id)
+        recipients: Optional[Dict[str, List[str]]] = None
         stage = "patch"
         try:
+            patch: Dict[str, Any] = {}
+            if reply:
+                recipients = self._reply_recipients(draft, draft_path, message)
+                if message.cc or message.bcc:
+                    patch["ccRecipients"] = self._recipient_payloads(recipients["cc"])
+                    patch["bccRecipients"] = self._recipient_payloads(recipients["bcc"])
             if action and message.body:
                 original = draft.get("body")
                 if not isinstance(original, dict) or "content" not in original:
@@ -1026,9 +1153,9 @@ class GraphBackend(GraphCalendarMixin, GraphContactsMixin, MailBackend):
                 body_tag = re.search(r"<body\b[^>]*>", content, re.IGNORECASE)
                 offset = body_tag.end() if body_tag else 0
                 content = content[:offset] + prelude + content[offset:]
-                self._request("PATCH", draft_path, json={
-                    "body": {"contentType": "HTML", "content": content},
-                })
+                patch["body"] = {"contentType": "HTML", "content": content}
+            if patch:
+                self._request("PATCH", draft_path, json=patch)
             stage = "attachments"
             for item in files:
                 self._request("POST", f"{draft_path}/attachments", json=item)
@@ -1039,7 +1166,37 @@ class GraphBackend(GraphCalendarMixin, GraphContactsMixin, MailBackend):
                 exc, draft_id, stage, cleanup=message.cleanup_on_failure,
             ) from exc
         result["tracking_id"] = None if action else self._published_tracking_id(message)
+        if recipients is not None:
+            result.update(recipients)
         return result
+
+    def _reply_recipients(
+        self, draft: Dict[str, Any], draft_path: str, message: OutgoingMessage,
+    ) -> Optional[Dict[str, List[str]]]:
+        """A reply draft's recipients with the caller's Cc and Bcc added.
+
+        Graph derives To and Cc (the sender, plus on reply-all the original
+        recipients other than us). The caller's Cc join Cc and their Bcc fill
+        Bcc; an address already listed anywhere, compared case-insensitively,
+        is not added again. None when the draft did not report its recipients
+        and there is nothing to add.
+        """
+        current = draft
+        if not all(name in current for name in _RECIPIENT_FIELDS):
+            if not (message.cc or message.bcc):
+                return None
+            current = self._request(
+                "GET", draft_path, params={"$select": ",".join(_RECIPIENT_FIELDS)},
+            ) or {}
+        to, cc, bcc = (self._addrs(current.get(name)) for name in _RECIPIENT_FIELDS)
+        seen = {address.lower() for address in to + cc + bcc}
+        for target, extra in ((cc, message.cc), (bcc, message.bcc)):
+            for address in extra:
+                address = (address or "").strip()
+                if address and address.lower() not in seen:
+                    target.append(address)
+                    seen.add(address.lower())
+        return {"to": to, "cc": cc, "bcc": bcc}
 
     def update_draft(
         self, draft_id: str, subject: Optional[str] = None,
@@ -1121,24 +1278,23 @@ class GraphBackend(GraphCalendarMixin, GraphContactsMixin, MailBackend):
 
     def send_message(self, message: OutgoingMessage) -> Dict[str, Any]:
         """Submit new mail or a native reply, retaining recoverable drafts on failure."""
-        draft_id = None
-        if message.attachments or (message.reply_to_message_id and message.body):
+        draft: Optional[Dict[str, Any]] = None
+        reply_id = message.reply_to_message_id
+        # A reply's own Cc/Bcc are merged onto a draft (see _create_draft);
+        # the one-step reply action would replace the derived recipients.
+        if message.attachments or (reply_id and (message.body or message.cc or message.bcc)):
             draft = (
-                self.create_reply_draft(message.reply_to_message_id, message)
-                if message.reply_to_message_id else self.create_draft(message)
+                self.create_reply_draft(reply_id, message)
+                if reply_id else self.create_draft(message)
             )
-            draft_id = draft["id"]
-            self._submit_created_draft(draft_id, message)
+            self._submit_created_draft(draft["id"], message)
         else:
-            if message.reply_to_message_id:
+            if reply_id:
                 action = "replyAll" if message.reply_all else "reply"
-                path = f"{self._draft_path(message.reply_to_message_id)}/{action}"
+                path = f"{self._draft_path(reply_id)}/{action}"
                 inner: Dict[str, Any] = {}
-                for field, recipients in (("toRecipients", message.to),
-                                          ("ccRecipients", message.cc),
-                                          ("bccRecipients", message.bcc)):
-                    if recipients:
-                        inner[field] = self._recipient_payloads(recipients)
+                if message.to:
+                    inner["toRecipients"] = self._recipient_payloads(message.to)
                 payload = {"message": inner}
             else:
                 path = f"{self._resource_prefix()}/sendMail"
@@ -1149,15 +1305,15 @@ class GraphBackend(GraphCalendarMixin, GraphContactsMixin, MailBackend):
                 raise self._draft_failure(exc, None, "send", cleanup=message.cleanup_on_failure) from exc
         result = {
             "sent": True, "backend": self.kind, "to": list(message.to),
-            "subject": message.subject, "replied_to": message.reply_to_message_id,
-            "tracking_id": (
-                None if message.reply_to_message_id
-                else self._published_tracking_id(message)
-            ),
+            "cc": list(message.cc), "bcc": list(message.bcc),
+            "subject": message.subject, "replied_to": reply_id,
+            "tracking_id": None if reply_id else self._published_tracking_id(message),
             "accepted_by_mail_server": True, "delivery_confirmed": False,
         }
-        if draft_id:
-            result["draft_id"] = draft_id
+        if draft is not None:
+            result["draft_id"] = draft["id"]
+            # A reply reports the recipients Graph put on its draft.
+            result.update({key: draft[key] for key in ("to", "cc", "bcc") if key in draft})
         return result
 
     def forward_message(

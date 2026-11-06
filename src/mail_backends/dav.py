@@ -5,17 +5,31 @@ DAV services that can reuse the same app-specific password. This module keeps
 those multi-step DAV flows behind the same MailBackend methods used by Graph.
 """
 from __future__ import annotations
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable, Optional
 from urllib.parse import quote, urljoin, urlparse
 from xml.etree import ElementTree as ET
+import re
 import uuid
 
 import httpx
-from icalendar import Calendar, Event
+from icalendar import Alarm, Calendar, Event
 import vobject
 
 from .base import MailBackendError
+from .calendar_rules import (
+    DEFAULT_REMINDER_MINUTES,
+    EXCEPTION,
+    SERIES_MASTER,
+    SINGLE,
+    WEEK_OF_MONTH,
+    WEEKDAYS,
+    CalendarRuleError,
+    describe_recurrence,
+    normalize_reminder,
+    normalize_scope,
+    series_target,
+)
 
 _DAV = "DAV:"
 _CALDAV = "urn:ietf:params:xml:ns:caldav"
@@ -104,6 +118,132 @@ def _as_list(value: Any) -> list[Any]:
     if value is None:
         return []
     return value if isinstance(value, list) else [value]
+
+
+# The events this backend writes carry UTC times without a VTIMEZONE, so an
+# RRULE on them would repeat at a fixed UTC time and drift by an hour at each
+# DST change; series are also neither expanded nor addressable per occurrence.
+_NO_RECURRENCE = (
+    "recurrence is not supported for CalDAV calendars: events are stored in UTC "
+    "without a time zone, so a repeating rule would shift by an hour at DST changes"
+)
+# A resource holding only a RECURRENCE-ID override (an invitation to one
+# occurrence) has no series this backend could reach.
+_DETACHED_OCCURRENCE = (
+    "scope='series' cannot reach a series from this CalDAV resource: it holds one "
+    "changed occurrence without its series"
+)
+_RRULE_FREQ = {"DAILY": "daily", "WEEKLY": "weekly", "MONTHLY": "monthly", "YEARLY": "yearly"}
+_RRULE_DAYS = dict(zip(("MO", "TU", "WE", "TH", "FR", "SA", "SU"), WEEKDAYS))
+_RRULE_PARTS = {"FREQ", "INTERVAL", "BYDAY", "BYMONTHDAY", "BYMONTH", "UNTIL", "COUNT", "WKST"}
+
+
+def _all_day(event: Event) -> bool:
+    start = getattr(event.get("DTSTART"), "dt", None)
+    return isinstance(start, date) and not isinstance(start, datetime)
+
+
+def _replace(event: Event, name: str, value: Any) -> None:
+    """Set one property of a parsed VEVENT; None removes it."""
+    event.pop(name.upper(), None)
+    if value is not None:
+        event.add(name, value)
+
+
+def _alarm(minutes: int) -> Alarm:
+    """A display reminder ``minutes`` before the event starts."""
+    alarm = Alarm()
+    alarm.add("action", "DISPLAY")
+    alarm.add("description", "Reminder")
+    alarm.add("trigger", timedelta(minutes=-minutes))
+    return alarm
+
+
+def _alarm_minutes(event: Event) -> Optional[int]:
+    """Minutes before the start of the event's first reminder, or None."""
+    start = getattr(event.get("DTSTART"), "dt", None)
+    for alarm in event.walk("VALARM"):
+        trigger = alarm.get("TRIGGER")
+        value = getattr(trigger, "dt", None)
+        if isinstance(value, timedelta):
+            related = str(trigger.params.get("RELATED", "START")).upper()
+            if related == "START" and value <= timedelta(0):
+                return int(-value.total_seconds() // 60)
+        elif isinstance(value, datetime) and isinstance(start, datetime):
+            lead = start - value
+            if lead >= timedelta(0):
+                return int(lead.total_seconds() // 60)
+    return None
+
+
+def _event_kind(event: Event) -> str:
+    if event.get("RRULE") is not None or event.get("RDATE") is not None:
+        return SERIES_MASTER
+    if event.get("RECURRENCE-ID") is not None:
+        return EXCEPTION
+    return SINGLE
+
+
+def _series_guard(kind: str, scope: Optional[str]) -> None:
+    """The series guard for a CalDAV resource, which is the whole series.
+
+    There are no occurrence ids to point the caller at, and a resource that
+    holds only one changed occurrence has no series this backend can reach.
+    """
+    if kind == SERIES_MASTER and scope != "series":
+        raise CalendarRuleError(
+            "item_id is a whole recurring series; CalDAV cannot address one occurrence, "
+            "so pass scope='series' to act on the series"
+        )
+    if series_target(kind, scope):
+        raise CalendarRuleError(_DETACHED_OCCURRENCE)
+
+
+def _as_day(value: Any) -> Optional[date]:
+    if isinstance(value, datetime):
+        return value.date()
+    return value if isinstance(value, date) else None
+
+
+def _rule_from_rrule(event: Event) -> dict[str, Any]:
+    """The tools' rule shape for a VEVENT's RRULE; other rules keep their text."""
+    rrule = event.get("RRULE")
+    if rrule is None or isinstance(rrule, list):
+        return {"pattern": "other", "description": "Repeats on dates listed in the event (RDATE or several RRULEs)"}
+    text = rrule.to_ical().decode()
+    other = {"pattern": "other", "description": f"RRULE {text}", "rrule": text}
+    freq = _RRULE_FREQ.get(str((rrule.get("FREQ") or [""])[0]).upper())
+    if not freq or set(rrule) - _RRULE_PARTS:
+        return other
+    first = _as_day(getattr(event.get("DTSTART"), "dt", None))
+    rule: dict[str, Any] = {"pattern": freq, "interval": int((rrule.get("INTERVAL") or [1])[0]),
+                            "start_date": first, "rrule": text}
+    byday = [re.fullmatch(r"([+-]?\d)?([A-Z]{2})", str(day).upper()) for day in rrule.get("BYDAY") or []]
+    if not all(byday) or any(match.group(2) not in _RRULE_DAYS for match in byday):
+        return other
+    if freq == "daily" and byday:
+        return other
+    if freq == "weekly":
+        if any(match.group(1) for match in byday):
+            return other
+        days = [_RRULE_DAYS[match.group(2)] for match in byday] or ([WEEKDAYS[first.weekday()]] if first else [])
+        rule["weekdays"] = sorted(set(days), key=WEEKDAYS.index)
+    elif freq in ("monthly", "yearly"):
+        if byday:
+            index = int(byday[0].group(1) or 0)
+            if len(byday) != 1 or index not in (1, 2, 3, 4, -1):
+                return other
+            rule["week_of_month"] = WEEK_OF_MONTH[index - 1 if index > 0 else 4]
+            rule["weekday"] = _RRULE_DAYS[byday[0].group(2)]
+        else:
+            rule["day_of_month"] = (rrule.get("BYMONTHDAY") or [first.day if first else None])[0]
+        if freq == "yearly":
+            rule["month"] = (rrule.get("BYMONTH") or [first.month if first else None])[0]
+    if rrule.get("UNTIL"):
+        rule["until"] = _as_day(rrule["UNTIL"][0])
+    elif rrule.get("COUNT"):
+        rule["count"] = int(rrule["COUNT"][0])
+    return rule
 
 
 class DAVMixin:
@@ -210,10 +350,15 @@ class DAVMixin:
     # CalDAV
     # ------------------------------------------------------------------
     def _event_component(self, body: str) -> Event:
-        calendar = Calendar.from_ical(body)
-        for component in calendar.walk("VEVENT"):
-            return component
-        raise MailBackendError("CalDAV resource did not contain a VEVENT")
+        return self._master_component(Calendar.from_ical(body))
+
+    @staticmethod
+    def _master_component(calendar: Calendar) -> Event:
+        """The resource's main VEVENT; RECURRENCE-ID ones override single occurrences."""
+        events = list(calendar.walk("VEVENT"))
+        if not events:
+            raise MailBackendError("CalDAV resource did not contain a VEVENT")
+        return next((event for event in events if event.get("RECURRENCE-ID") is None), events[0])
 
     def _event_payload(self, href: str, etag: Optional[str], body: str) -> dict[str, Any]:
         event = self._event_component(body)
@@ -221,6 +366,7 @@ class DAVMixin:
         for raw in _as_list(event.get("ATTENDEE")):
             text = str(raw)
             attendees.append(text[7:] if text.upper().startswith("MAILTO:") else text)
+        kind = _event_kind(event)
         return {
             "item_id": href,
             "uid": str(event.get("UID") or ""),
@@ -230,8 +376,14 @@ class DAVMixin:
             "end": _iso(event.get("DTEND")),
             "location": str(event.get("LOCATION") or ""),
             "organizer": str(event.get("ORGANIZER") or ""),
-            "is_all_day": isinstance(getattr(event.get("DTSTART"), "dt", None), date) and not isinstance(getattr(event.get("DTSTART"), "dt", None), datetime),
+            "is_all_day": _all_day(event),
             "attendees": attendees,
+            # A CalDAV resource holds a whole series: it is listed once, as
+            # its master, with the rule.
+            "type": kind,
+            "series_master_id": None,
+            "reminder_minutes": _alarm_minutes(event),
+            "recurrence": describe_recurrence(_rule_from_rrule(event)) if kind == SERIES_MASTER else None,
         }
 
     def _calendar_body(self, *, uid: str, subject: str, start_time: Any, end_time: Any, fields: dict[str, Any]) -> bytes:
@@ -253,25 +405,36 @@ class DAVMixin:
             event.add("categories", category)
         for attendee in fields.get("attendees") or []:
             event.add("attendee", "MAILTO:" + str(attendee))
+        if fields.get("reminder_minutes") is not None:
+            event.add_component(_alarm(fields["reminder_minutes"]))
         calendar.add_component(event)
         return calendar.to_ical()
 
     def create_appointment(self, *, subject, start_time, end_time, **fields) -> dict[str, Any]:
         if not isinstance(subject, str) or not subject:
             raise MailBackendError("subject is required")
+        if fields.get("recurrence") is not None:
+            raise CalendarRuleError(_NO_RECURRENCE)
+        # Same default as Exchange and Graph: 15 minutes unless null asks for none.
+        reminder = (normalize_reminder(fields["reminder_minutes"]) if "reminder_minutes" in fields
+                    else DEFAULT_REMINDER_MINUTES)
         uid = str(uuid.uuid4())
         collection = self._collection_href("cal")
         href = collection + quote(uid, safe="") + ".ics"
-        body = self._calendar_body(uid=uid, subject=subject, start_time=start_time, end_time=end_time, fields=fields)
+        body = self._calendar_body(uid=uid, subject=subject, start_time=start_time, end_time=end_time,
+                                   fields={**fields, "reminder_minutes": reminder})
         response = self._dav_request("PUT", self._dav_url("cal", href), content=body, headers={"If-None-Match": "*", "Content-Type": "text/calendar; charset=utf-8"})
         return {"item_id": href, "uid": uid, "etag": response.headers.get("ETag"), "subject": subject,
-                "start_time": _parse_datetime(start_time).isoformat(), "end_time": _parse_datetime(end_time).isoformat()}
+                "start_time": _parse_datetime(start_time).isoformat(), "end_time": _parse_datetime(end_time).isoformat(),
+                "type": SINGLE, "reminder_minutes": reminder, "recurrence": None}
 
-    def get_calendar(self, *, start_date=None, end_date=None, days_ahead=7, max_results=50) -> dict[str, Any]:
+    def get_calendar(self, *, start_date=None, end_date=None, days_ahead=7, max_results=50,
+                     include_recurrence=False) -> dict[str, Any]:
+        # include_recurrence needs no extra work here: a recurring resource is
+        # listed as its series master, which always carries its rule.
         start = _parse_datetime(start_date) if start_date else datetime.now(timezone.utc)
         end = _parse_datetime(end_date) if end_date else start.replace(day=start.day)  # replaced below for clarity
         if end_date is None:
-            from datetime import timedelta
             end = start + timedelta(days=min(max(1, days_ahead), 90))
         collection = self._collection_href("cal")
         body = f'''<?xml version="1.0"?><c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:prop><d:getetag/><c:calendar-data/></d:prop><c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT"><c:time-range start="{start.strftime('%Y%m%dT%H%M%SZ')}" end="{end.strftime('%Y%m%dT%H%M%SZ')}"/></c:comp-filter></c:comp-filter></c:filter></c:calendar-query>'''
@@ -292,27 +455,57 @@ class DAVMixin:
         response = self._dav_request("GET", self._dav_url("cal", href), headers={"Accept": "text/calendar"})
         return response.text, response.headers.get("ETag")
 
-    def update_appointment(self, item_id, **fields) -> dict[str, Any]:
+    def update_appointment(self, item_id, *, scope=None, **fields) -> dict[str, Any]:
+        scope = normalize_scope(scope)
+        reminder = normalize_reminder(fields["reminder_minutes"]) if "reminder_minutes" in fields else None
         body, etag = self._get_event_resource(item_id)
-        event = self._event_component(body)
-        uid = str(event.get("UID") or uuid.uuid4())
-        subject = fields.get("subject", str(event.get("SUMMARY") or ""))
-        start = fields.get("start_time", _iso(event.get("DTSTART")))
-        end = fields.get("end_time", _iso(event.get("DTEND")))
-        merged = {
-            "is_all_day": fields.get("is_all_day", isinstance(getattr(event.get("DTSTART"), "dt", None), date) and not isinstance(getattr(event.get("DTSTART"), "dt", None), datetime)),
-            "location": fields.get("location", str(event.get("LOCATION") or "")),
-            "body": fields.get("body", str(event.get("DESCRIPTION") or "")),
-        }
+        calendar = Calendar.from_ical(body)
+        event = self._master_component(calendar)
+        kind = _event_kind(event)
+        _series_guard(kind, scope)
+        timed = any(key in fields for key in ("start_time", "end_time", "is_all_day"))
+        if kind == SERIES_MASTER and timed:
+            raise CalendarRuleError(
+                "changing the time of a CalDAV series is not supported: its exceptions and "
+                "EXDATEs are keyed to the original start times"
+            )
+        # Edit the stored VEVENT in place, so attendees, alarms, the RRULE and
+        # anything else this tool does not manage survive the update.
+        uid = str(event.get("UID") or "")
+        if not uid:
+            uid = str(uuid.uuid4())
+            event.add("uid", uid)
+        if "subject" in fields:
+            _replace(event, "summary", fields["subject"] or "")
+        if "location" in fields:
+            _replace(event, "location", fields["location"])
+        if "body" in fields:
+            _replace(event, "description", fields["body"])
         if "categories" in fields:
-            merged["categories"] = fields["categories"]
-        response = self._dav_request("PUT", self._dav_url("cal", item_id), content=self._calendar_body(uid=uid, subject=subject, start_time=start, end_time=end, fields=merged), headers={"If-Match": etag or "*", "Content-Type": "text/calendar; charset=utf-8"})
-        changed = [key for key in ("subject", "start_time", "end_time", "location", "body", "categories") if key in fields]
-        return {"item_id": item_id, "uid": uid, "etag": response.headers.get("ETag"), "updated_fields": changed}
+            event.pop("CATEGORIES", None)
+            for category in fields["categories"] or []:
+                event.add("categories", category)
+        if timed:
+            all_day = fields.get("is_all_day", _all_day(event))
+            _replace(event, "dtstart", _ical_time(fields.get("start_time", _iso(event.get("DTSTART"))), all_day))
+            if "end_time" in fields or event.get("DTEND") is not None:
+                _replace(event, "dtend", _ical_time(fields.get("end_time", _iso(event.get("DTEND"))), all_day))
+        if "reminder_minutes" in fields:
+            event.subcomponents = [part for part in event.subcomponents if part.name != "VALARM"]
+            if reminder is not None:
+                event.add_component(_alarm(reminder))
+        _replace(event, "dtstamp", datetime.now(timezone.utc))
+        response = self._dav_request("PUT", self._dav_url("cal", item_id), content=calendar.to_ical(), headers={"If-Match": etag or "*", "Content-Type": "text/calendar; charset=utf-8"})
+        changed = [key for key in ("subject", "start_time", "end_time", "location", "body", "categories", "reminder_minutes") if key in fields]
+        return {"item_id": item_id, "uid": uid, "etag": response.headers.get("ETag"), "updated_fields": changed, "type": kind}
 
-    def delete_appointment(self, item_id, *, send_cancellation=True) -> dict[str, Any]:
-        self._dav_request("DELETE", self._dav_url("cal", item_id))
-        return {"item_id": item_id, "cancellation_sent": False,
+    def delete_appointment(self, item_id, *, send_cancellation=True, scope=None) -> dict[str, Any]:
+        scope = normalize_scope(scope)
+        body, etag = self._get_event_resource(item_id)
+        kind = _event_kind(self._event_component(body))
+        _series_guard(kind, scope)
+        self._dav_request("DELETE", self._dav_url("cal", item_id), headers={"If-Match": etag} if etag else None)
+        return {"item_id": item_id, "type": kind, "cancellation_sent": False,
                 "note": "CalDAV delete removed the calendar resource; meeting cancellation delivery is provider-specific and was not sent."}
 
     def respond_to_meeting(self, item_id, *, response, message=""):

@@ -310,7 +310,8 @@ Three modes selected via `mode`:
 
 | Name | Type | Notes |
 |---|---|---|
-| `is_flagged` | `bool` | filter by Outlook follow-up flag (`PR_FLAG_STATUS=2`). New in v4. |
+| `is_flagged` | `bool` | filter by Outlook follow-up flag (`PR_FLAG_STATUS=2`). `false` keeps its old meaning and can include completed messages |
+| `flag_status` | `"NotFlagged"\|"Flagged"\|"Complete"` | exact follow-up state. Exchange in all modes; Graph and IMAP in quick/full_text; IMAP has no `Complete`. Results report `flag_status` |
 | `is_read` | `bool` | |
 | `has_attachments` | `bool` | |
 | `categories` | `string[]` | the message must carry every listed category (all modes) |
@@ -318,9 +319,20 @@ Three modes selected via `mode`:
 | `subject_contains`, `body_contains`, `from_address`, `to_address` | `string` | |
 | `start_date`, `end_date` | ISO 8601 `string` | |
 | `offset` / `max_results` | `int` | pagination via `next_offset` in response |
-| `search_scope` | `string[]` | folders to search (advanced/full_text) |
-| `sort_by`, `sort_order` | enums | `ascending`/`descending` |
-| `query`, `search_query`, `keywords`, `exact_phrase`, `search_in` | full_text mode |
+| `search_scope` | `string[]` | folders to search, in every mode. `["all"]` searches every mail folder and merges one sorted page with each item's `folder`; Deleted Items, Junk, Drafts and Outbox are excluded unless listed next to `all`. The response reports `folders_searched` and `folders_failed`. Exchange caps `all` at `EWS_SEARCH_ALL_MAX_FOLDERS` (50). Graph: quick/full_text. IMAP: no `all` |
+| `sort_by`, `sort_order` | enums | `ascending`/`descending`; quick and advanced |
+| `query`, `search_query`, `keywords`, `exact_phrase`, `search_in` | see below. `search_in` selects `subject`, `body` and/or `attachments` (file names); the text must occur inside one selected field |
+
+Parameters belong to modes: `query` (quick, full_text), `search_query`,
+`search_in` and `exact_phrase` (full_text), `keywords` (advanced),
+`sort_by`/`sort_order` (quick and advanced). Using one in another mode, an
+unknown `mode` or sort value, an unparseable date, or an unknown
+`search_scope` folder raises a `ValidationError` that names what to use. A
+value equal to the schema default counts as not set. `search_scope` takes the
+aliases `inbox`, `sent`, `drafts`, `deleted`, `junk`, `all`, or a folder path,
+name or ID from `list_folders`, in every mode. `to_address` is matched on the
+To list (a full address must match exactly). Graph/IMAP search refuses
+`is_read=true` and `keywords`.
 
 ### `get_email_details`
 
@@ -406,11 +418,12 @@ quote the original body or copy its inline images.
 |---|---|
 | `body_format` | `html` / `markdown` / `text` (v4) |
 | `reply_all` | bool, default false. The sender and original To go in To, the original Cc stays in Cc, without your own address or duplicates |
+| `cc`, `bcc` | extra recipient arrays on all three providers. Cc joins the derived recipients; Bcc holds only these. Each address is listed once, case-insensitively. IMAP keeps Bcc blind by removing a Bcc address from To/Cc |
 | `files` | canonical attachments on **all three providers**; same schema as `send_email`. All files are loaded before sending. |
 | `attachments`, `inline_attachments` | **deprecated, Exchange only**; still additive to `files` on existing supported paths |
 | `cleanup_on_failure` | Graph multi-step send recovery; default false |
 | `folder` | source folder for IMAP messages outside Inbox; use a standard alias or native folder `id`/`path` |
-| `dry_run` | bool, default false: validate and preview without sending. Exchange also reads the original and returns `would_send_to`, `would_cc`, `subject`, `message_checked: true`; Graph/IMAP do not touch the provider (`message_checked: false`). Returns `would_attach`, `files_validated`, `files_fetched`. |
+| `dry_run` | bool, default false: validate and preview without sending. Exchange also reads the original and returns `would_send_to`, `would_cc`, `would_bcc`, `subject`, `message_checked: true`; Graph/IMAP do not touch the provider (`message_checked: false`) and report only the caller's `would_cc`/`would_bcc`. Returns `would_attach`, `files_validated`, `files_fetched`. |
 | `verify_files` | with `dry_run`: load every `files` entry to prove it resolves (same as `send_email`) |
 
 On Exchange, the reply body is wrapped in the standard Outlook `WordSection1` div +
@@ -809,13 +822,29 @@ for archiving, audit, and forensics.
 
 | Tool | Highlights |
 |---|---|
-| `create_appointment` | `subject`, `start_time`, `end_time`, `location`, `body`, `attendees`, `is_all_day`, `reminder_minutes`, **`categories`** (v4) |
-| `get_calendar` | range query, returns events with `item_id`, `subject`, `start`, `end`, `location`, `organizer`, `attendees`, `is_all_day` |
-| `update_appointment` | `item_id` plus optional fields to update; `categories` v4 |
-| `delete_appointment` | optional `send_cancellation: bool` (default true) |
+| `create_appointment` | `subject`, `start_time`, `end_time`, `location`, `body`, `attendees`, `is_all_day`, `reminder_minutes` (default 15; `0` at start, `null` none), **`categories`** (v4), `recurrence` (see below) |
+| `get_calendar` | range query, returns events with `item_id`, `subject`, `start`, `end`, `location`, `organizer`, `attendees`, `is_all_day`, `type` (`single`, `occurrence`, `exception`, `series_master`), `series_master_id`, `reminder_minutes`; `include_recurrence=true` adds each series' rule |
+| `update_appointment` | `item_id` plus optional fields to update; `categories` v4; `reminder_minutes` (`null` clears); `scope="series"` to change a whole series |
+| `delete_appointment` | optional `send_cancellation: bool` (default true); `scope="series"` to delete a whole series |
 | `respond_to_meeting` | `response: "Accept" / "Decline" / "Tentative"` + optional body |
 | `check_availability` | `email_addresses[]`, `start_time`, `end_time`, returns free/busy |
 | `find_meeting_times` | `attendees[]`, `duration_minutes`, `date_range_start`, `date_range_end`, scored suggestions |
+
+**Recurring series.** `recurrence` is an object with `pattern` (`daily`,
+`weekly`, `monthly` or `yearly`), optional `interval`, `weekdays` (weekly),
+`day_of_month` or `week_of_month` + `weekday` (monthly/yearly), `month`
+(yearly), and an end of `until` (inclusive date) or `count`, or neither for
+no end. `start_time`/`end_time` describe the first occurrence, and every
+pattern field must agree with it. The series keeps its wall-clock time in
+`TIMEZONE` across DST changes. Exchange yearly patterns take no interval
+(use monthly with 12×N). Graph supports the same object. CalDAV/iCloud
+refuses creating a series.
+
+An occurrence or exception id acts on that instance only. A series master id
+is refused unless `scope="series"`, and `scope="series"` with an occurrence id
+acts on its master. A series update may change the time of day but must stay
+on the series' first date. Invalid recurrence, reminder or scope input fails
+before anything is sent.
 
 **Graph scope and account limits.** Native Graph routes implement event
 creation, calendar listing, partial update, deletion and meeting response under

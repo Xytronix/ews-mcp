@@ -86,6 +86,14 @@ _FETCH_SUMMARY = (
     "REPLY-TO IMPORTANCE X-PRIORITY CONTENT-TYPE)])"
 )
 
+# IMAP knows only the \Flagged system flag, so there is no Complete state.
+_FLAG_SEARCH_KEYS = {"NotFlagged": "UNFLAGGED", "Flagged": "FLAGGED"}
+
+
+def _flag_status(flags: Sequence[str]) -> str:
+    """``flag_status`` from lower-cased FETCH FLAGS."""
+    return "Flagged" if "\\flagged" in flags else "NotFlagged"
+
 
 def _decode_header_value(raw: Optional[str]) -> str:
     """RFC 2047 -> str, tolerating malformed encoded words."""
@@ -636,6 +644,7 @@ class IMAPBackend(DAVMixin, MailBackend):
             sent=_header_date(headers.get("Date")),
             is_read="\\seen" in flags,
             is_flagged="\\flagged" in flags,
+            flag_status=_flag_status(flags),
             has_attachments=self._headers_suggest_attachments(headers),
             importance=_decode_header_value(importance) or None,
             internet_message_id=(headers.get("Message-ID") or "").strip() or None,
@@ -730,10 +739,18 @@ class IMAPBackend(DAVMixin, MailBackend):
         unread_only: bool = False,
         has_attachments: Optional[bool] = None,
         limit: int = 25,
+        flag_status: Optional[str] = None,
     ) -> List[MailMessage]:
         criteria: List[str] = []
         if unread_only:
             criteria.append("UNSEEN")
+        if flag_status:
+            if flag_status not in _FLAG_SEARCH_KEYS:
+                raise MailBackendError(
+                    f"flag_status={flag_status!r}: IMAP has only the \\Flagged flag, "
+                    f"so it can search {' or '.join(_FLAG_SEARCH_KEYS)} only"
+                )
+            criteria.append(_FLAG_SEARCH_KEYS[flag_status])
         if from_address:
             criteria += ["FROM", _imap_literal(from_address)]
         if subject:
@@ -811,6 +828,7 @@ class IMAPBackend(DAVMixin, MailBackend):
             sent=_header_date(parsed.get("Date")),
             is_read="\\seen" in flags,
             is_flagged="\\flagged" in flags,
+            flag_status=_flag_status(flags),
             has_attachments=bool(attachments),
             importance=_decode_header_value(importance) or None,
             internet_message_id=(parsed.get("Message-ID") or "").strip() or None,
@@ -1463,22 +1481,30 @@ class IMAPBackend(DAVMixin, MailBackend):
             )
             if not recipients:
                 recipients = [original.from_address] if original.from_address else []
+            # Same split as create_reply_draft: the sender (plus the original
+            # To on reply-all) go in To, the caller's Cc (plus the original Cc
+            # on reply-all) in Cc. Nobody appears twice and Bcc recipients stay
+            # blind. Reply-all never mails us; a plain reply keeps its sender
+            # even when that is us.
+            seen: set = set()
+            blind: List[str] = []
+            for address in bcc:
+                if address.lower() not in seen:
+                    blind.append(address)
+                    seen.add(address.lower())
+            to_sources, cc_sources = recipients, cc
             if message.reply_all:
-                # Same split as create_reply_draft: the sender and original To
-                # go in To, caller and original Cc in Cc. Nobody appears twice,
-                # we never mail ourselves, and Bcc recipients stay blind.
-                seen = {self.email.lower(), *(address.lower() for address in bcc)}
-                to_all: List[str] = []
-                cc_all: List[str] = []
-                for target, addresses in (
-                    (to_all, recipients + list(original.to)),
-                    (cc_all, cc + list(original.cc)),
-                ):
-                    for address in addresses:
-                        if address and address.lower() not in seen:
-                            target.append(address)
-                            seen.add(address.lower())
-                recipients, cc = to_all, cc_all
+                seen.add(self.email.lower())
+                to_sources = recipients + list(original.to)
+                cc_sources = cc + list(original.cc)
+            to_all: List[str] = []
+            cc_all: List[str] = []
+            for target, addresses in ((to_all, to_sources), (cc_all, cc_sources)):
+                for address in addresses:
+                    if address and address.lower() not in seen:
+                        target.append(address)
+                        seen.add(address.lower())
+            recipients, cc, bcc = to_all, cc_all, blind
 
         if not recipients:
             raise MailBackendError("no recipients: 'to' is required")

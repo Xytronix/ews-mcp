@@ -26,7 +26,7 @@ from ..utils import (
     sanitize_html,
 )
 from ..body_format import compose_body, WRITE_FORMAT_SCHEMA as BODY_FORMAT_SCHEMA
-from .email_tools import add_reply_prefix, add_forward_prefix, reply_recipients
+from .email_tools import add_reply_prefix, add_forward_prefix, address_list, reply_recipients
 from .outgoing_attachments import (
     FILES_SCHEMA, load_outgoing_files, attach_outgoing_files, save_draft_with_attachments,
 )
@@ -289,8 +289,9 @@ class CreateReplyDraftTool(BaseTool):
         body_format = kwargs.get("body_format", "html")
         # Issue #119: caller-supplied cc/bcc were silently dropped on the
         # saved draft. Now propagated alongside the auto-derived recipients.
-        extra_cc = kwargs.get("cc") or []
-        extra_bcc = kwargs.get("bcc") or []
+        # A comma/semicolon string is a list of addresses, not of characters.
+        extra_cc = address_list(kwargs.get("cc"), "cc")
+        extra_bcc = address_list(kwargs.get("bcc"), "bcc")
         categories = kwargs.get("categories")  # Issue #114
 
         # Convert markdown/text bodies to HTML BEFORE the heuristic in

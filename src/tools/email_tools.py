@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime
 from exchangelib import Message, Mailbox, FileAttachment, ItemAttachment, HTMLBody, Body, Folder, ExtendedProperty
-from exchangelib.errors import ErrorTimeoutExpired
+from exchangelib.errors import ErrorFolderNotFound, ErrorTimeoutExpired
 from exchangelib.queryset import Q
 
 # Define Flag as ExtendedProperty for setting email flag status
@@ -29,6 +29,7 @@ FLAG_STATUS_MAP = {
     'Flagged': 2,
     'Complete': 1,
 }
+_FLAG_STATUS_BY_VALUE = {value: name for name, value in FLAG_STATUS_MAP.items() if value}
 import re
 
 from .base import BaseTool
@@ -117,6 +118,7 @@ _DB_FIELDS_BY_PUBLIC: Dict[str, tuple] = {
     "body_html": ("body",),
     "conversation_id": ("conversation_id",),
     "thread_id": ("conversation_id",),
+    "flag_status": ("flag_status_value",),
 }
 
 
@@ -431,6 +433,391 @@ def _with_fields(only_fields: tuple, *needed: str) -> tuple:
     return tuple(only_fields) + extra
 
 
+# Where full_text mode can look for the query text.
+_FULL_TEXT_AREAS = ("subject", "body", "attachments")
+
+
+def _full_text_areas(search_in: Any) -> List[str]:
+    """Validate ``search_in``; an empty or unknown area would search nothing."""
+    if isinstance(search_in, str):
+        search_in = [search_in]
+    areas = [str(area).strip().lower() for area in (search_in or [])]
+    unknown = [area for area in areas if area not in _FULL_TEXT_AREAS]
+    if unknown:
+        raise ValidationError(
+            f"search_in: unknown area {unknown[0]!r}; use any of "
+            f"{', '.join(_FULL_TEXT_AREAS)}"
+        )
+    if not areas:
+        raise ValidationError(
+            f"search_in must name at least one of {', '.join(_FULL_TEXT_AREAS)}"
+        )
+    return list(dict.fromkeys(areas))
+
+
+def _full_text_matcher(query_text: str, areas: List[str]):
+    """Verify a full_text hit locally, one field at a time.
+
+    The text must occur inside a single selected field: joining subject and
+    body let a phrase that straddled the two match. Attachment names are only
+    checked here because EWS cannot restrict on them.
+    """
+    needle = query_text.casefold()
+
+    def matches(item: Any) -> bool:
+        if "subject" in areas and needle in str(safe_get(item, "subject", "") or "").casefold():
+            return True
+        if "body" in areas and needle in item_text_body(item).casefold():
+            return True
+        if "attachments" in areas:
+            return any(
+                needle in str(safe_get(attachment, "name", "") or "").casefold()
+                for attachment in (safe_get(item, "attachments", None) or ())
+            )
+        return False
+
+    return matches
+
+
+# The DB fields ``_full_text_matcher`` reads for each area. ``attachments``
+# loads attachment metadata (names), never the attachment content.
+_FULL_TEXT_MATCH_FIELDS = {
+    "subject": ("subject",),
+    "body": ("text_body", "body"),
+    "attachments": ("attachments",),
+}
+
+
+_FLAG_STATUS_NAMES = {name.lower(): name for name in FLAG_STATUS_MAP}
+
+
+def normalize_flag_status(value: Any) -> Optional[str]:
+    """Return the canonical ``flag_status`` filter value, or None when absent."""
+    if value in (None, ""):
+        return None
+    name = _FLAG_STATUS_NAMES.get(str(value).strip().lower())
+    if name is None:
+        raise ValidationError(
+            f"flag_status={value!r}: use one of {', '.join(FLAG_STATUS_MAP)}"
+        )
+    return name
+
+
+def _flag_status_q(status: str) -> Q:
+    """EWS restriction on PidTagFlagStatus for one ``flag_status`` name.
+
+    A message that was never flagged has no such property, and comparing a
+    missing property is undefined in Exchange restrictions, so NotFlagged
+    names the missing property explicitly besides excluding both set values.
+    """
+    if status == "NotFlagged":
+        return Q(flag_status_value__exists=False) | (
+            ~Q(flag_status_value=FLAG_STATUS_MAP["Flagged"])
+            & ~Q(flag_status_value=FLAG_STATUS_MAP["Complete"])
+        )
+    return Q(flag_status_value=FLAG_STATUS_MAP[status])
+
+
+def _item_flag_status(item: Any) -> str:
+    """``flag_status`` of an item fetched with PidTagFlagStatus."""
+    return _FLAG_STATUS_BY_VALUE.get(safe_get(item, "flag_status_value", None), "NotFlagged")
+
+
+# ``search_scope=["all"]`` searches every mail folder of the mailbox. These
+# folders and their subfolders stay out unless named next to "all"; the value
+# is the Account attribute of the folder.
+_ALL_SCOPE = "all"
+_ALL_SCOPE_OPTIONAL = {
+    "deleted": "trash",
+    "trash": "trash",
+    "junk": "junk",
+    "drafts": "drafts",
+    "outbox": "outbox",
+}
+# Every page fetches up to offset + max_results + 1 items from each folder,
+# so the folder count bounds the cost of one whole-mailbox search.
+SEARCH_ALL_MAX_FOLDERS = int(os.environ.get("EWS_SEARCH_ALL_MAX_FOLDERS", "50"))
+
+
+def _is_mail_folder_class(folder_class: Optional[str]) -> bool:
+    # Folders created through exchangelib can lack a class altogether.
+    return not folder_class or folder_class.strip().lower() == "ipf.note"
+
+
+def _all_mail_folders(account: Any, include: set) -> List[Tuple[str, Any]]:
+    """Every mail folder under msg_folder_root as ``(path, folder)`` pairs.
+
+    Deleted Items, Junk, Drafts and Outbox are skipped with their whole
+    subtree unless ``include`` names their Account attribute. Non-mail
+    folders (calendar, contacts, ...) are skipped but still walked, so mail
+    folders below them are found.
+    """
+    excluded = set()
+    for attr in sorted(set(_ALL_SCOPE_OPTIONAL.values()) - include):
+        try:
+            folder = getattr(account, attr)
+        except ErrorFolderNotFound:
+            continue  # the mailbox has no such folder, so nothing to leave out
+        folder_id = safe_get(folder, "id", None)
+        if folder_id:
+            excluded.add(folder_id)
+
+    found: List[Tuple[str, Any]] = []
+
+    def visit(parent: Any, prefix: str) -> None:
+        for child in parent.children:
+            if safe_get(child, "id", None) in excluded:
+                continue
+            name = safe_get(child, "name", "") or ""
+            path = f"{prefix}/{name}" if prefix else name
+            if _is_mail_folder_class(safe_get(child, "folder_class", None)):
+                found.append((path, child))
+            visit(child, path)
+
+    visit(account.msg_folder_root, "")
+    return found
+
+
+def _scope_names(search_scope: Any) -> List[str]:
+    """``search_scope`` entries, stripped; a bare value is one entry.
+
+    Case is kept because folder IDs are case-sensitive.
+    """
+    if search_scope in (None, ""):
+        return []
+    if not isinstance(search_scope, (list, tuple)):
+        search_scope = [search_scope]
+    return [str(name).strip() for name in search_scope if str(name).strip()]
+
+
+# The scope names that map straight to a well-known folder (Account attribute).
+_SCOPE_FOLDERS = {
+    "inbox": "inbox",
+    "sent": "sent",
+    "drafts": "drafts",
+    "deleted": "trash",
+    "junk": "junk",
+}
+_SCOPE_ACCEPTED = (
+    f"{', '.join(_SCOPE_FOLDERS)}, all, or a folder path, name or ID from list_folders"
+)
+
+
+async def _resolve_search_scope(
+    account: Any, search_scope: Any,
+) -> Tuple[List[Tuple[str, Any]], bool]:
+    """Folders named by ``search_scope`` as ``(label, folder)`` pairs.
+
+    The flag says whether the scope is the whole mailbox (``"all"``), whose
+    labels are folder paths. Any other name resolves like ``folder`` does
+    (path, custom folder name or folder ID); a name that matches no mail
+    folder is refused instead of being dropped from the search.
+    """
+    names = _scope_names(search_scope)
+    if _ALL_SCOPE not in [name.lower() for name in names]:
+        resolved: List[Tuple[str, Any]] = []
+        seen: set = set()
+        for name in names:
+            attr = _SCOPE_FOLDERS.get(name.lower())
+            if attr:
+                folder = getattr(account, attr)
+            else:
+                try:
+                    folder = await resolve_folder_for_account(account, name)
+                except ToolExecutionError as exc:
+                    raise ValidationError(
+                        f"search_scope: folder {name!r} not found. Accepted: {_SCOPE_ACCEPTED}.",
+                        hint=str(exc),
+                    ) from exc
+                folder_class = safe_get(folder, "folder_class", None)
+                if not _is_mail_folder_class(folder_class):
+                    raise ValidationError(
+                        f"search_scope: {name!r} is not a mail folder ({folder_class}). "
+                        f"Accepted: {_SCOPE_ACCEPTED}."
+                    )
+            key = safe_get(folder, "id", None) or id(folder)
+            if key in seen:
+                continue  # the same folder named twice is searched once
+            seen.add(key)
+            resolved.append((safe_get(folder, "name", None) or name, folder))
+        return resolved, False
+
+    extras = [name for name in names if name.lower() != _ALL_SCOPE]
+    unknown = [
+        name for name in extras
+        if name.lower() not in _ALL_SCOPE_OPTIONAL and name.lower() not in ("inbox", "sent")
+    ]
+    if unknown:
+        raise ValidationError(
+            f"search_scope: {unknown[0]!r} cannot be combined with 'all', which "
+            f"already covers every mail folder; next to 'all' name only "
+            f"{', '.join(sorted(_ALL_SCOPE_OPTIONAL))} to search those as well."
+        )
+    include = {
+        _ALL_SCOPE_OPTIONAL[name.lower()] for name in extras
+        if name.lower() in _ALL_SCOPE_OPTIONAL
+    }
+    folders = _all_mail_folders(account, include)
+    if not folders:
+        raise ToolExecutionError("search_scope=['all'] found no mail folders in this mailbox")
+    if len(folders) > SEARCH_ALL_MAX_FOLDERS:
+        raise ToolExecutionError(
+            f"search_scope=['all'] covers {len(folders)} mail folders, more than "
+            f"the limit of {SEARCH_ALL_MAX_FOLDERS} for one search. Search named "
+            f"folders instead, or raise EWS_SEARCH_ALL_MAX_FOLDERS on the server."
+        )
+    return folders, True
+
+
+def _whole_mailbox_report(
+    folders: List[Tuple[str, Any]], per_folder_errors: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Which folders a ``search_scope=['all']`` search covered and which failed.
+
+    A failed folder does not fail the search; its error is listed instead.
+    """
+    failed = {error["folder"] for error in per_folder_errors}
+    return {
+        "folders_searched": [label for label, _folder in folders if label not in failed],
+        "folders_failed": list(per_folder_errors),
+    }
+
+
+def _folder_errors(response: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """The per-folder errors a multi-folder search put in ``meta``."""
+    return (response.get("meta") or {}).get("per_folder_errors", [])
+
+
+@dataclass
+class _SearchFilters:
+    """EWS restrictions plus the local checks every hit must also pass."""
+
+    restrictions: List[Any] = field(default_factory=list)
+    matchers: List[Any] = field(default_factory=list)
+    #: DB fields the matchers read, to add to a ``.only()`` projection
+    match_fields: Tuple[str, ...] = ()
+
+    def restriction(self) -> Optional[Any]:
+        combined = None
+        for restriction in self.restrictions:
+            combined = restriction if combined is None else combined & restriction
+        return combined
+
+    def matcher(self) -> Optional[Any]:
+        if not self.matchers:
+            return None
+        matchers = list(self.matchers)
+        return lambda item: all(match(item) for match in matchers)
+
+
+def _date_restriction_value(kwargs: Dict[str, Any], key: str) -> Optional[Any]:
+    raw = kwargs.get(key)
+    if not raw:
+        return None
+    parsed = parse_datetime_tz_aware(raw)
+    if parsed is None:
+        # Dropping an unreadable date would silently widen the search.
+        raise ValidationError(f"{key}={raw!r} is not an ISO 8601 date or date-time")
+    return parsed
+
+
+def _recipient_matcher(needle: str):
+    """Local check that a message's To names ``needle``.
+
+    EWS cannot restrict on recipient lists (exchangelib refuses
+    ``to_recipients`` in a restriction), so the filter runs on the fetched
+    To list: a full address must equal one recipient, anything else is a
+    case-insensitive part of an address or display name.
+    """
+    wanted = needle.strip().casefold()
+    exact = is_full_address(wanted)
+
+    def matches(item: Any) -> bool:
+        for recipient in safe_get(item, "to_recipients", None) or ():
+            address = str(safe_get(recipient, "email_address", "") or "").casefold()
+            name = str(safe_get(recipient, "name", "") or "").casefold()
+            if address == wanted if exact else (wanted in address or wanted in name):
+                return True
+        return False
+
+    return matches
+
+
+def _quick_filters(kwargs: Dict[str, Any], *, free_text: bool = True) -> _SearchFilters:
+    """The quick-mode filters in ``kwargs``; full_text mode applies them too.
+
+    ``sender``/``recipient`` alias ``from_address``/``to_address``. ``query``
+    (subject OR body) is a filter here only when ``free_text`` is set; in
+    full_text mode it is the search text itself. A partial sender and the
+    recipient are checked locally because EWS has no substring restriction on
+    mailboxes and none at all on recipient lists, and the subject because
+    SmarterMail can ignore a subject restriction.
+    """
+    filters = _SearchFilters()
+    add = filters.restrictions.append
+
+    subject_contains = kwargs.get("subject_contains")
+    if subject_contains:
+        add(Q(subject__contains=subject_contains))
+        filters.matchers.append(_subject_search_matcher(subject_contains))
+        filters.match_fields += ("subject",)
+    if kwargs.get("body_contains"):
+        add(Q(body__contains=kwargs["body_contains"]))
+    if free_text and kwargs.get("query"):
+        add(Q(subject__contains=kwargs["query"]) | Q(body__contains=kwargs["query"]))
+    from_address = kwargs.get("from_address") or kwargs.get("sender")
+    if from_address and is_full_address(from_address):
+        add(Q(sender=from_address))
+    elif from_address:
+        filters.matchers.append(lambda item, needle=from_address: sender_matches(item, needle))
+        filters.match_fields += ("sender",)
+    to_address = kwargs.get("to_address") or kwargs.get("recipient")
+    if to_address:
+        filters.matchers.append(_recipient_matcher(to_address))
+        filters.match_fields += ("to_recipients",)
+    if kwargs.get("has_attachments") is not None:
+        add(Q(has_attachments=kwargs["has_attachments"]))
+    if kwargs.get("is_read") is not None:
+        add(Q(is_read=kwargs["is_read"]))
+    if kwargs.get("is_flagged") is not None:
+        # Issue #115: PR_FLAG_STATUS 2 is flagged. false excludes only that
+        # value, so completed messages count as not flagged.
+        add(Q(flag_status_value=2) if kwargs["is_flagged"] else ~Q(flag_status_value=2))
+    flag_status = normalize_flag_status(kwargs.get("flag_status"))
+    if flag_status:
+        add(_flag_status_q(flag_status))
+    if kwargs.get("importance"):
+        add(Q(importance=kwargs["importance"]))
+    if kwargs.get("categories"):
+        # A message must carry every listed category.
+        add(Q(categories__contains=kwargs["categories"]))
+    start = _date_restriction_value(kwargs, "start_date")
+    if start is not None:
+        add(Q(datetime_received__gte=start))
+    end = _date_restriction_value(kwargs, "end_date")
+    if end is not None:
+        add(Q(datetime_received__lte=end))
+    return filters
+
+
+def address_list(value: Any, field: str) -> List[str]:
+    """Accept a list, or a comma/semicolon separated string, of addresses."""
+    if value in (None, "", []):
+        return []
+    if isinstance(value, str):
+        parts = [p.strip() for p in value.replace(";", ",").split(",")]
+        return [p for p in parts if p]
+    if isinstance(value, (list, tuple)):
+        out: List[str] = []
+        for item in value:
+            if isinstance(item, str) and item.strip():
+                out.append(item.strip())
+            elif item is not None and not isinstance(item, str):
+                raise ValidationError(f"{field} must contain e-mail address strings")
+        return out
+    raise ValidationError(f"{field} must be a string or an array of strings")
+
+
 def _missing_last(value: Any) -> tuple:
     # An item without the value sorts as the smallest (last when newest
     # first) and None is never compared with a real value.
@@ -525,6 +912,7 @@ def _build_list_item(
         ],
         "received_time": received_iso,
         "is_read": safe_get(email, "is_read", False),
+        "flag_status": _item_flag_status(email),
         "has_attachments": safe_get(email, "has_attachments", False),
         "importance": safe_get(email, "importance", "Normal"),
         "categories": safe_get(email, "categories", []) or [],
@@ -535,6 +923,93 @@ def _build_list_item(
         item["body"] = text_body
     strip_body_by_default(item, keep_body="body" in fields)
     return project_fields(item, fields)
+
+
+# Search results show the follow-up flag state by default; a whole-mailbox
+# search also names the folder each hit came from.
+_SEARCH_DEFAULT_FIELDS: Tuple[str, ...] = (*LIST_DEFAULT_FIELDS, "flag_status")
+
+
+def _search_fields(kwargs: Dict[str, Any], *, all_scope: bool = False) -> List[str]:
+    """The caller's ``fields`` projection, else the search default."""
+    if kwargs.get("fields"):
+        return kwargs["fields"]
+    return [*_SEARCH_DEFAULT_FIELDS, *(("folder",) if all_scope else ())]
+
+
+SEARCH_MODES = ("quick", "advanced", "full_text")
+
+# Parameters that mean something in some search modes only.
+_MODE_PARAMS: Dict[str, Tuple[str, ...]] = {
+    "query": ("quick", "full_text"),
+    "search_query": ("full_text",),
+    "keywords": ("advanced",),
+    "search_in": ("full_text",),
+    "exact_phrase": ("full_text",),
+    "sort_by": ("quick", "advanced"),
+    "sort_order": ("quick", "advanced"),
+}
+_MODE_PARAM_NOTES = {
+    "query": "advanced mode searches subject and body with keywords",
+    "search_query": "it is full_text mode's old name for query",
+    "keywords": "quick and full_text mode take the text as query",
+    "sort_by": "full_text results are always newest first",
+    "sort_order": "full_text results are always newest first",
+}
+# A value equal to the schema default changes nothing, and some clients fill
+# defaults in, so it is not a request for a mode-specific behaviour.
+_SEARCH_PARAM_DEFAULTS: Dict[str, Any] = {
+    "search_in": ["subject", "body"],
+    "exact_phrase": False,
+    "sort_by": "datetime_received",
+    "sort_order": "descending",
+}
+_SORT_FIELDS = ("datetime_received", "datetime_sent", "from", "subject", "importance")
+
+
+def search_param_is_default(name: str, value: Any) -> bool:
+    """True when ``value`` is absent or equals the search schema default."""
+    if value in (None, "", []):
+        return True
+    default = _SEARCH_PARAM_DEFAULTS.get(name)
+    if isinstance(default, list) and isinstance(value, (list, tuple)):
+        return sorted(str(v).strip().lower() for v in value) == sorted(default)
+    return default is not None and value == default
+
+
+def search_mode(kwargs: Dict[str, Any]) -> str:
+    """The requested search mode; an unknown one is refused, not run as quick."""
+    mode = str(kwargs.get("mode") or "quick").strip().lower()
+    if mode not in SEARCH_MODES:
+        raise ValidationError(
+            f"mode={kwargs.get('mode')!r}: use one of {', '.join(SEARCH_MODES)}"
+        )
+    return mode
+
+
+def reject_other_mode_params(kwargs: Dict[str, Any], mode: str) -> None:
+    """Refuse a parameter the requested mode would ignore, naming its mode."""
+    for name, modes in _MODE_PARAMS.items():
+        if mode in modes or search_param_is_default(name, kwargs.get(name)):
+            continue
+        note = _MODE_PARAM_NOTES.get(name)
+        raise ValidationError(
+            f"{name} is not used in mode {mode!r}; use mode "
+            f"{' or '.join(repr(m) for m in modes)}" + (f" ({note})." if note else ".")
+        )
+
+
+def _sort_spec(kwargs: Dict[str, Any]) -> Tuple[str, bool]:
+    """``(exchangelib field, descending)`` for sort_by / sort_order."""
+    sort_by = kwargs.get("sort_by") or "datetime_received"
+    sort_order = kwargs.get("sort_order") or "descending"
+    if sort_by not in _SORT_FIELDS:
+        raise ValidationError(f"sort_by={sort_by!r}: use one of {', '.join(_SORT_FIELDS)}")
+    if sort_order not in ("ascending", "descending"):
+        raise ValidationError(f"sort_order={sort_order!r}: use ascending or descending")
+    # ``from`` is a public name, not an exchangelib field. Results and the
+    # from_address filter read it from ``sender``, so sort on that too.
+    return _DB_FIELDS_BY_PUBLIC.get(sort_by, (sort_by,))[0], sort_order == "descending"
 
 
 def extract_body_html(message) -> str:
@@ -1517,6 +1992,7 @@ class ReadEmailsTool(BaseTool):
                     "bcc": [r.email_address for r in (safe_get(item, "bcc_recipients", []) or []) if r and hasattr(r, "email_address") and r.email_address],
                     "received_time": iso_or_none(safe_get(item, "datetime_received", None)),
                     "is_read": safe_get(item, "is_read", False),
+                    "flag_status": _item_flag_status(item),
                     "has_attachments": safe_get(item, "has_attachments", False),
                     "preview": truncate_text(text_body, 200)
                 }
@@ -1560,12 +2036,12 @@ class SearchEmailsTool(BaseTool):
                     "mode": {
                         "type": "string",
                         "enum": ["quick", "advanced", "full_text"],
-                        "description": "Search mode: quick (filter by subject/sender/date), advanced (multi-folder with sort/categories/importance), full_text (search across subject/body/attachments)",
+                        "description": "Search mode: quick (filter by subject/sender/date), advanced (multi-folder with sort/categories/importance), full_text (search text in subject/body/attachment names, narrowed by the same filters as quick)",
                         "default": "quick"
                     },
                     "folder": {
                         "type": "string",
-                        "description": "Folder to search (quick mode). Standard names: inbox, sent, drafts; paths: Inbox/CC; or folder ID",
+                        "description": "Folder to search (quick mode without search_scope). Standard names: inbox, sent, drafts; paths: Inbox/CC; or folder ID",
                         "default": "inbox"
                     },
                     "subject_contains": {
@@ -1582,7 +2058,7 @@ class SearchEmailsTool(BaseTool):
                     },
                     "to_address": {
                         "type": "string",
-                        "description": "Filter by recipient email (quick + advanced mode)"
+                        "description": "Filter by recipient (all modes): a full address must equal one To recipient; anything else matches part of a To address or name"
                     },
                     "recipient": {
                         "type": "string",
@@ -1590,11 +2066,11 @@ class SearchEmailsTool(BaseTool):
                     },
                     "query": {
                         "type": "string",
-                        "description": "Quick mode: subject-OR-body substring. Full-text mode: search text (also accepted as search_query)."
+                        "description": "Quick mode: subject-OR-body substring. Full-text mode: search text (also accepted as search_query). Refused in advanced mode, which uses keywords."
                     },
                     "search_query": {
                         "type": "string",
-                        "description": "Legacy alias for 'query' in full_text mode."
+                        "description": "Legacy alias for 'query' in full_text mode; refused in other modes."
                     },
                     "fields": {
                         "type": "array",
@@ -1602,7 +2078,8 @@ class SearchEmailsTool(BaseTool):
                         "description": (
                             "Result projection. Returned items include only the "
                             "named fields. Default: message_id, subject, from, "
-                            "received_time, is_read, has_attachments, snippet. "
+                            "received_time, is_read, flag_status, has_attachments, "
+                            "snippet, plus folder for search_scope=['all']. "
                             "Include 'body' / 'body_html' to opt into heavy fields."
                         ),
                     },
@@ -1629,7 +2106,19 @@ class SearchEmailsTool(BaseTool):
                             "Filter by Outlook follow-up flag. true returns only "
                             "messages currently flagged for follow-up; false returns "
                             "only unflagged messages. Maps to the EWS "
-                            "PR_FLAG_STATUS extended property (Issue #115)."
+                            "PR_FLAG_STATUS extended property (Issue #115); "
+                            "false also returns completed messages, so use "
+                            "flag_status to tell NotFlagged from Complete."
+                        )
+                    },
+                    "flag_status": {
+                        "type": "string",
+                        "enum": ["NotFlagged", "Flagged", "Complete"],
+                        "description": (
+                            "Filter by follow-up flag state (all modes): "
+                            "NotFlagged (never flagged or cleared), Flagged, or "
+                            "Complete. Combines with is_flagged like any other "
+                            "filter. Results report each message's flag_status."
                         )
                     },
                     "start_date": {
@@ -1648,16 +2137,16 @@ class SearchEmailsTool(BaseTool):
                     },
                     "keywords": {
                         "type": "string",
-                        "description": "Keywords to search in subject and body (advanced mode)"
+                        "description": "Keywords to search in subject and body (advanced mode only; quick and full_text take the text as query)"
                     },
                     "body_contains": {
                         "type": "string",
-                        "description": "Filter by body containing text (advanced mode)"
+                        "description": "Filter by body containing text (all modes)"
                     },
                     "importance": {
                         "type": "string",
                         "enum": ["Low", "Normal", "High"],
-                        "description": "Filter by importance level (advanced mode)"
+                        "description": "Filter by importance level (all modes)"
                     },
                     "categories": {
                         "type": "array",
@@ -1667,30 +2156,56 @@ class SearchEmailsTool(BaseTool):
                     "search_scope": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Folders to search (advanced/full_text mode, e.g. ['inbox', 'sent'])",
+                        "description": (
+                            "Folders to search, in any mode (quick mode uses it "
+                            "instead of folder), e.g. ['inbox', 'sent']. Names: "
+                            "inbox, sent, drafts, deleted, junk, or a folder path, "
+                            "name or ID from list_folders; a name that matches no "
+                            "mail folder is refused. ['all'] searches every mail "
+                            "folder of the mailbox in one call, merged into one "
+                            "sorted, paged result with each item's folder; "
+                            "Deleted Items, Junk, Drafts and Outbox (with their "
+                            "subfolders) stay out unless listed next to 'all', "
+                            "e.g. ['all', 'deleted']. On Exchange each page reads "
+                            "up to offset + max_results + 1 messages per folder, "
+                            "a mailbox with more mail folders than "
+                            "EWS_SEARCH_ALL_MAX_FOLDERS (default 50) is refused, "
+                            "and the response lists folders_searched and "
+                            "folders_failed. Graph mailboxes support 'all'; IMAP "
+                            "mailboxes search one folder per call."
+                        ),
                         "default": ["inbox"]
                     },
                     "sort_by": {
                         "type": "string",
                         "enum": ["datetime_received", "datetime_sent", "from", "subject", "importance"],
-                        "description": "Sort field (advanced mode)",
+                        "description": "Sort field (quick and advanced modes; full_text results are always newest first)",
                         "default": "datetime_received"
                     },
                     "sort_order": {
                         "type": "string",
                         "enum": ["ascending", "descending"],
-                        "description": "Sort order (advanced mode)",
+                        "description": "Sort order (quick and advanced modes)",
                         "default": "descending"
                     },
                     "search_in": {
                         "type": "array",
                         "items": {"type": "string", "enum": ["subject", "body", "attachments"]},
-                        "description": "Where to search (full_text mode)",
+                        "description": (
+                            "Where to search (full_text mode only). The text must "
+                            "occur within one selected field; a match in any "
+                            "selected field counts. 'attachments' matches "
+                            "attachment file names, case-insensitively."
+                        ),
                         "default": ["subject", "body"]
                     },
                     "exact_phrase": {
                         "type": "boolean",
-                        "description": "Search for exact phrase match (full_text mode)",
+                        "description": (
+                            "Verify every hit locally as a contiguous, "
+                            "case-insensitive phrase within one selected field "
+                            "(full_text mode only)"
+                        ),
                         "default": False
                     },
                     "target_mailbox": {
@@ -1702,18 +2217,19 @@ class SearchEmailsTool(BaseTool):
         }
 
     # Parameter vocabulary accepted across all modes (schema-level).
-    # See _validate_kwargs for the strict check. Quick and advanced modes
-    # share most filters; full_text has its own query/search_in/exact_phrase.
+    # See _validate_kwargs for the strict check. All modes share the filters
+    # and search_scope; full_text adds query/search_in/exact_phrase.
     _ALLOWED_PARAMS: set = {
         # Routing
         "mode", "folder", "target_mailbox", "max_results", "offset",
-        # Quick + advanced shared
+        # Filters shared by every mode, except query (quick, full_text) and
+        # keywords (advanced); see _MODE_PARAMS
         "subject_contains", "from_address", "to_address", "sender",
         "recipient", "body_contains", "query",
-        "has_attachments", "is_read", "is_flagged", "importance",
+        "has_attachments", "is_read", "is_flagged", "flag_status", "importance",
         "categories", "keywords",
         "start_date", "end_date",
-        # Advanced-only
+        # Scope (every mode) and sort (quick and advanced)
         "search_scope", "sort_by", "sort_order",
         # Full-text-only
         "search_query", "search_in", "exact_phrase",
@@ -1727,7 +2243,7 @@ class SearchEmailsTool(BaseTool):
     _QUICK_FILTER_KEYS: tuple = (
         "subject_contains", "from_address", "sender", "to_address", "recipient",
         "body_contains", "query", "has_attachments", "is_read", "is_flagged",
-        "importance", "categories",
+        "flag_status", "importance", "categories",
     )
 
     def _validate_kwargs(self, kwargs: Dict[str, Any]) -> None:
@@ -1753,7 +2269,8 @@ class SearchEmailsTool(BaseTool):
     async def execute(self, **kwargs) -> Dict[str, Any]:
         """Route to appropriate search mode (serialized, throttle-aware)."""
         self._validate_kwargs(kwargs)
-        mode = kwargs.get("mode", "quick")
+        mode = search_mode(kwargs)
+        reject_other_mode_params(kwargs, mode)
 
         if mode == "advanced":
             run = self._search_advanced
@@ -1769,117 +2286,99 @@ class SearchEmailsTool(BaseTool):
         Accepts a union of filter keys. ``query`` matches subject OR body.
         ``sender`` is a synonym for ``from_address`` (and ``recipient`` for
         ``to_address``) — the schema previously advertised both spellings
-        but only the ``*_address`` forms were wired up.
+        but only the ``*_address`` forms were wired up. ``search_scope``
+        searches its folders instead of ``folder``, merged in sort order.
         """
-        from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
         import socket
 
         target_mailbox = kwargs.get("target_mailbox")
+        # A folder or scope equal to its schema default (inbox) yields to the
+        # other, because some clients fill defaults in; two real choices
+        # contradict each other.
+        folder_named = str(kwargs.get("folder") or "").strip().lower() not in ("", "inbox")
+        scoped = [name.lower() for name in _scope_names(kwargs.get("search_scope"))] not in (
+            [], ["inbox"],
+        )
+        if scoped and folder_named:
+            raise ValidationError(
+                "quick mode searches either 'folder' or 'search_scope'; pass one of them."
+            )
+        sort_field, descending = _sort_spec(kwargs)
 
-        # Normalise aliases so the rest of the function only has to check
-        # one canonical key per concept.
-        from_address = kwargs.get("from_address") or kwargs.get("sender")
-        to_address = kwargs.get("to_address") or kwargs.get("recipient")
-        subject_contains = kwargs.get("subject_contains")
-        body_contains = kwargs.get("body_contains")
-        free_text = kwargs.get("query")
-        text_matcher = _subject_search_matcher(subject_contains)
+        # Auto-add date range ONLY when *no* filter was supplied. The
+        # Bug 1 regression was that this check only considered four
+        # filter keys; query/sender/body_contains/etc. used to fall
+        # through the default and get replaced by "last 30 days",
+        # silently discarding the caller's intent.
+        if not kwargs.get("start_date") and not kwargs.get("end_date"):
+            has_filters = any(
+                kwargs.get(key) not in (None, "", [])
+                for key in self._QUICK_FILTER_KEYS
+            )
+
+            if not has_filters:
+                from datetime import timedelta
+                default_days_back = 30
+                auto_start_date = datetime.now() - timedelta(days=default_days_back)
+                kwargs["start_date"] = auto_start_date.isoformat()
+                self.logger.info(
+                    "search_emails quick: no filters and no date range; "
+                    f"auto-limiting to last {default_days_back} days"
+                )
+        filters = _quick_filters(kwargs)
+        restriction = filters.restriction()
+        text_matcher = filters.matcher()
+        max_results = kwargs.get("max_results", 50)
+        offset = max(0, int(kwargs.get("offset", 0)))
 
         try:
             account = self.get_account(target_mailbox)
             mailbox = self.get_mailbox_info(target_mailbox)
 
-            # Auto-add date range ONLY when *no* filter was supplied. The
-            # Bug 1 regression was that this check only considered four
-            # filter keys; query/sender/body_contains/etc. used to fall
-            # through the default and get replaced by "last 30 days",
-            # silently discarding the caller's intent.
-            if not kwargs.get("start_date") and not kwargs.get("end_date"):
-                has_filters = any(
-                    kwargs.get(key) not in (None, "", [])
-                    for key in self._QUICK_FILTER_KEYS
+            if scoped:
+                search_scope = kwargs["search_scope"]
+                folders, all_scope = await _resolve_search_scope(account, search_scope)
+                if not folders:
+                    raise ToolExecutionError(f"No valid folders found in search_scope: {search_scope}")
+                fields = _search_fields(kwargs, all_scope=all_scope)
+                # The merge reads the sort value from each item.
+                only_fields = _with_fields(
+                    _db_fields_for(fields), *filters.match_fields,
+                    *((sort_field,) if sort_field in _MERGE_SORT_KEYS else ()),
+                )
+                response = self._search_folders(
+                    folders,
+                    restriction=restriction,
+                    matcher=text_matcher,
+                    only_fields=only_fields,
+                    sort_field=sort_field,
+                    descending=descending,
+                    offset=offset,
+                    max_results=max_results,
+                    fields=fields,
+                    tool="search_emails.quick",
+                )
+                response["folders_searched"] = search_scope
+                if all_scope:
+                    response.update(_whole_mailbox_report(folders, _folder_errors(response)))
+                response["mailbox"] = mailbox
+                return format_success_response(
+                    f"Found {response['count']} matching emails", **response,
                 )
 
-                if not has_filters:
-                    from datetime import timedelta
-                    default_days_back = 30
-                    auto_start_date = datetime.now() - timedelta(days=default_days_back)
-                    kwargs["start_date"] = auto_start_date.isoformat()
-                    self.logger.info(
-                        "search_emails quick: no filters and no date range; "
-                        f"auto-limiting to last {default_days_back} days"
-                    )
-
-            folder_name = kwargs.get("folder", "inbox")
+            folder_name = kwargs.get("folder") or "inbox"
             folder = await resolve_folder_for_account(account, folder_name)
 
             query = folder.all()
-
-            if subject_contains:
-                query = query.filter(subject__contains=subject_contains)
-            if body_contains:
-                query = query.filter(body__contains=body_contains)
-            # `query` is a free-text parameter: subject OR body substring.
-            if free_text:
-                query = query.filter(
-                    Q(subject__contains=free_text) | Q(body__contains=free_text)
-                )
-            if from_address and is_full_address(from_address):
-                query = query.filter(sender=from_address)
-            elif from_address:
-                # Partial sender ("anthropic.com", "@x.de", a name): EWS has no
-                # substring restriction on Mailbox fields, so verify locally.
-                _base_matcher = text_matcher
-                _needle = from_address
-
-                def text_matcher(email, _b=_base_matcher, _n=_needle):
-                    return sender_matches(email, _n) and (_b is None or _b(email))
-            if to_address:
-                query = query.filter(to_recipients__contains=to_address)
-            if kwargs.get("has_attachments") is not None:
-                query = query.filter(has_attachments=kwargs["has_attachments"])
-            if kwargs.get("is_read") is not None:
-                query = query.filter(is_read=kwargs["is_read"])
-            if kwargs.get("is_flagged") is not None:
-                # Issue #115: filter on the PR_FLAG_STATUS extended property.
-                # The ``flag_status_value`` field is registered on Message at
-                # module import (see top of this file). EWS stores the flag
-                # as an integer (None=unflagged, 1=complete, 2=flagged).
-                # Map the boolean accordingly.
-                if kwargs["is_flagged"]:
-                    query = query.filter(flag_status_value=2)
-                else:
-                    # Unflagged includes both None and 1 (Complete). EWS
-                    # filter syntax can't OR null-or-1 cleanly without a Q,
-                    # so we exclude the flagged value instead.
-                    query = query.exclude(flag_status_value=2)
-            if kwargs.get("importance"):
-                query = query.filter(importance=kwargs["importance"])
-            if kwargs.get("categories"):
-                # Same restriction as advanced mode: every listed category.
-                query = query.filter(categories__contains=kwargs["categories"])
-            if kwargs.get("start_date"):
-                start = parse_datetime_tz_aware(kwargs["start_date"])
-                query = query.filter(datetime_received__gte=start)
-            if kwargs.get("end_date"):
-                end = parse_datetime_tz_aware(kwargs["end_date"])
-                query = query.filter(datetime_received__lte=end)
-
-            query = query.order_by('-datetime_received')
-            max_results = kwargs.get("max_results", 50)
-            offset = max(0, int(kwargs.get("offset", 0)))
+            if restriction is not None:
+                query = query.filter(restriction)
+            query = query.order_by(f"-{sort_field}" if descending else sort_field)
 
             # Field projection: if the caller supplied ``fields=[...]``,
             # the response items will be restricted to that set. When
             # omitted, we use the list-default (no raw body; snippet only).
-            fields = kwargs.get("fields") or list(LIST_DEFAULT_FIELDS)
-            only_fields = _db_fields_for(fields)
-            only_fields = _with_subject_search_field(
-                only_fields,
-                subject_contains,
-            )
-            if only_fields and from_address and "sender" not in only_fields:
-                only_fields = tuple(only_fields) + ("sender",)
+            fields = _search_fields(kwargs)
+            only_fields = _with_fields(_db_fields_for(fields), *filters.match_fields)
             if only_fields:
                 try:
                     query = query.only(*only_fields)
@@ -1953,256 +2452,207 @@ class SearchEmailsTool(BaseTool):
             raise ToolExecutionError(
                 f"Search timed out. Try adding start_date/end_date, reducing max_results, or adding more filters."
             )
-        except ToolExecutionError:
+        except (ValidationError, ToolExecutionError):
             raise
         except Exception as e:
             self.logger.error(f"Failed to search emails: {e}")
             raise ToolExecutionError(f"Failed to search emails: {e}")
 
+    def _search_folders(
+        self,
+        folders: List[Tuple[str, Any]],
+        *,
+        restriction: Any,
+        matcher: Any,
+        only_fields: tuple,
+        sort_field: str,
+        descending: bool,
+        offset: int,
+        max_results: int,
+        fields: List[str],
+        tool: str,
+    ) -> Dict[str, Any]:
+        """Search every ``(label, folder)`` and merge one sorted page.
+
+        Returns the response fields every multi-folder search shares: items,
+        count, total_available (None when a folder's count is unknown),
+        next_offset when more follow, and meta.per_folder_errors. A failing
+        folder is reported there and never fails the search.
+        """
+        per_folder: List[Tuple[str, List[Any]]] = []
+        per_folder_errors: List[Dict[str, Any]] = []
+        total_available_sum = 0
+        some_total_unknown = False
+        fetch_offset, fetch_limit = _folder_fetch_window(len(folders), offset, max_results)
+        order = f"-{sort_field}" if descending else sort_field
+        start_time = datetime.now()
+
+        for folder_name, folder in folders:
+            try:
+                query = folder.filter(restriction) if restriction is not None else folder.all()
+                if only_fields:
+                    try:
+                        query = query.only(*only_fields)
+                    except Exception as only_exc:
+                        # .only() can reject unknown fields on older
+                        # exchangelib versions — fall back to full
+                        # projection rather than fail the search.
+                        self.logger.debug(
+                            "query.only(%s) rejected on %s: %s",
+                            only_fields, folder_name, only_exc,
+                        )
+                query = query.order_by(order)
+            except Exception as setup_exc:
+                # Filter/sort setup itself failed — classify and carry.
+                per_folder_errors.append({
+                    "folder": folder_name,
+                    "error_code": _classify_ews_error(setup_exc),
+                    "error_message": f"{type(setup_exc).__name__}: {setup_exc}",
+                })
+                self.logger.warning(
+                    "%s setup on %s failed: %s: %s",
+                    tool, folder_name, type(setup_exc).__name__, setup_exc,
+                )
+                some_total_unknown = True
+                continue
+
+            if matcher is None:
+                outcome = _paginate_query(
+                    query,
+                    max_results=fetch_limit,
+                    offset=fetch_offset,
+                    chunk_size=50,
+                    logger=self.logger,
+                    folder_label=folder_name,
+                )
+            else:
+                outcome = _paginate_query_matching(
+                    query,
+                    matcher=matcher,
+                    max_results=fetch_limit,
+                    offset=fetch_offset,
+                    chunk_size=50,
+                    logger=self.logger,
+                    folder_label=folder_name,
+                )
+            ews_call_log(
+                self.logger, "FindItem",
+                result_count=len(outcome.items),
+                total_available=outcome.total_available,
+                page_offset=fetch_offset,
+                folder=folder_name,
+                outcome="ok" if outcome.error_code is None else outcome.error_code,
+                error_type=(
+                    outcome.error_message.split(":", 1)[0]
+                    if outcome.error_message else None
+                ),
+                extra_fields={"tool": tool},
+            )
+
+            if outcome.total_available is None:
+                some_total_unknown = True
+            else:
+                total_available_sum += outcome.total_available
+            if outcome.error_code:
+                per_folder_errors.append({
+                    "folder": folder_name,
+                    "error_code": outcome.error_code,
+                    "error_message": outcome.error_message,
+                })
+            per_folder.append((folder_name, outcome.items))
+
+        page, has_more = _merge_folder_page(
+            per_folder,
+            sort_field=sort_field,
+            descending=descending,
+            skip=offset - fetch_offset,
+            limit=max_results,
+        )
+        items = [
+            _build_list_item(item, fields=fields, folder_name=name) for name, item in page
+        ]
+        # A sum across folders when every folder reported a count; None if
+        # at least one was unknown.
+        total_available = None if some_total_unknown else total_available_sum
+        response: Dict[str, Any] = {
+            "items": items,
+            "count": len(items),
+            "total_available": total_available,
+        }
+        if has_more:
+            response["next_offset"] = offset + len(items)
+        if per_folder_errors:
+            response["meta"] = {"per_folder_errors": per_folder_errors}
+
+        ews_call_log(
+            self.logger, f"{tool}_total",
+            duration_ms=int((datetime.now() - start_time).total_seconds() * 1000),
+            result_count=len(items),
+            total_available=total_available,
+            page_offset=offset,
+            outcome="ok" if not per_folder_errors else "partial",
+            extra_fields={"folders": len(folders)},
+        )
+        return response
+
     async def _search_advanced(self, **kwargs) -> Dict[str, Any]:
-        """Advanced search: multi-folder with sort, categories, importance, keywords."""
+        """Advanced search: multi-folder with sort, categories, importance, keywords.
+
+        Takes the same filters as quick mode (aliases included) plus keywords,
+        which match subject OR body.
+        """
         target_mailbox = kwargs.get("target_mailbox")
         search_scope = kwargs.get("search_scope", ["inbox"])
         max_results = kwargs.get("max_results", 250)
-        sort_by = kwargs.get("sort_by", "datetime_received")
-        sort_order = kwargs.get("sort_order", "descending")
-        # ``from`` is a public name, not an exchangelib field. Results and the
-        # from_address filter read it from ``sender``, so sort on that too.
-        sort_field = _DB_FIELDS_BY_PUBLIC.get(sort_by, (sort_by,))[0]
-        text_matcher = _subject_search_matcher(kwargs.get("subject_contains"))
+        sort_field, descending = _sort_spec(kwargs)
+        filters = _quick_filters(kwargs, free_text=False)
+        if kwargs.get("keywords"):
+            keywords = kwargs["keywords"]
+            filters.restrictions.insert(
+                0, Q(subject__contains=keywords) | Q(body__contains=keywords),
+            )
+        if not filters.restrictions and not filters.matchers:
+            raise ToolExecutionError("No valid search filters provided for advanced mode")
 
         try:
             account = self.get_account(target_mailbox)
             mailbox = self.get_mailbox_info(target_mailbox)
 
-            folder_map = {
-                "inbox": account.inbox,
-                "sent": account.sent,
-                "drafts": account.drafts,
-                "deleted": account.trash,
-                "junk": account.junk
-            }
-
-            folders = []
-            for folder_name in search_scope:
-                folder = folder_map.get(folder_name.lower())
-                if folder:
-                    folders.append(folder)
-
+            folders, all_scope = await _resolve_search_scope(account, search_scope)
             if not folders:
                 raise ToolExecutionError(f"No valid folders found in search_scope: {search_scope}")
 
-            # Build query filters
-            q_filters = []
-
-            if kwargs.get("keywords"):
-                kw = kwargs["keywords"]
-                q_filters.append(Q(subject__contains=kw) | Q(body__contains=kw))
-            adv_sender_needle = None
-            if kwargs.get("from_address"):
-                if is_full_address(kwargs["from_address"]):
-                    q_filters.append(Q(sender=kwargs["from_address"]))
-                else:
-                    adv_sender_needle = kwargs["from_address"]
-            if kwargs.get("to_address"):
-                q_filters.append(Q(to_recipients__contains=kwargs["to_address"]))
-            if kwargs.get("subject_contains"):
-                q_filters.append(Q(subject__contains=kwargs["subject_contains"]))
-            if kwargs.get("body_contains"):
-                q_filters.append(Q(body__contains=kwargs["body_contains"]))
-            if "has_attachments" in kwargs and kwargs["has_attachments"] is not None:
-                q_filters.append(Q(has_attachments=kwargs["has_attachments"]))
-            if kwargs.get("importance"):
-                q_filters.append(Q(importance=kwargs["importance"]))
-            if kwargs.get("categories"):
-                q_filters.append(Q(categories__contains=kwargs["categories"]))
-            if "is_read" in kwargs and kwargs["is_read"] is not None:
-                q_filters.append(Q(is_read=kwargs["is_read"]))
-            if "is_flagged" in kwargs and kwargs["is_flagged"] is not None:
-                # Issue #115 — flag_status_value=2 means flagged for follow-up.
-                if kwargs["is_flagged"]:
-                    q_filters.append(Q(flag_status_value=2))
-                else:
-                    q_filters.append(~Q(flag_status_value=2))
-            if kwargs.get("start_date"):
-                start_date = parse_datetime_tz_aware(kwargs["start_date"])
-                if start_date:
-                    q_filters.append(Q(datetime_received__gte=start_date))
-            if kwargs.get("end_date"):
-                end_date = parse_datetime_tz_aware(kwargs["end_date"])
-                if end_date:
-                    q_filters.append(Q(datetime_received__lte=end_date))
-
-            if not q_filters and not adv_sender_needle:
-                raise ToolExecutionError("No valid search filters provided for advanced mode")
-
-            combined_filter = q_filters[0] if q_filters else None
-            for q_filter in q_filters[1:]:
-                combined_filter &= q_filter
-            if adv_sender_needle:
-                _adv_base = text_matcher
-
-                def text_matcher(email, _b=_adv_base, _n=adv_sender_needle):
-                    return sender_matches(email, _n) and (_b is None or _b(email))
-
-            # Field projection (Bug 6). Default: no body.
-            fields = kwargs.get("fields") or list(LIST_DEFAULT_FIELDS)
+            # Field projection (Bug 6). Default: no body. The merge reads the
+            # sort value from each item.
+            fields = _search_fields(kwargs, all_scope=all_scope)
             offset = max(0, int(kwargs.get("offset", 0)))
-            only_fields = _db_fields_for(fields)
-            only_fields = _with_subject_search_field(
-                only_fields,
-                kwargs.get("subject_contains"),
+            only_fields = _with_fields(
+                _db_fields_for(fields), *filters.match_fields,
+                *((sort_field,) if sort_field in _MERGE_SORT_KEYS else ()),
             )
-            if adv_sender_needle:
-                only_fields = _with_fields(only_fields, "sender")
-            # The merge below reads the sort value from each item.
-            if sort_field in _MERGE_SORT_KEYS:
-                only_fields = _with_fields(only_fields, sort_field)
 
-            per_folder: List[Tuple[str, List[Any]]] = []
-            per_folder_errors: List[Dict[str, Any]] = []
-            total_available_sum: Optional[int] = 0
-            some_total_unknown = False
-
-            fetch_offset, fetch_limit = _folder_fetch_window(
-                len(folders), offset, max_results,
-            )
-            start_time = datetime.now()
-
-            for folder in folders:
-                folder_name = safe_get(folder, "name", "Unknown")
-                try:
-                    query = (
-                        folder.filter(combined_filter)
-                        if combined_filter is not None else folder.all()
-                    )
-                    if only_fields:
-                        try:
-                            query = query.only(*only_fields)
-                        except Exception as only_exc:
-                            # .only() can reject unknown fields on older
-                            # exchangelib versions — fall back to full
-                            # projection rather than fail the search.
-                            self.logger.debug(
-                                "query.only(%s) rejected on %s: %s",
-                                only_fields, folder_name, only_exc,
-                            )
-                    order = sort_field
-                    if sort_order == "descending" and not order.startswith('-'):
-                        order = f"-{order}"
-                    query = query.order_by(order)
-                except Exception as setup_exc:
-                    # Filter/sort setup itself failed — classify and carry.
-                    per_folder_errors.append({
-                        "folder": folder_name,
-                        "error_code": _classify_ews_error(setup_exc),
-                        "error_message": f"{type(setup_exc).__name__}: {setup_exc}",
-                    })
-                    self.logger.warning(
-                        "advanced-search setup on %s failed: %s: %s",
-                        folder_name, type(setup_exc).__name__, setup_exc,
-                    )
-                    some_total_unknown = True
-                    continue
-
-                if text_matcher is None:
-                    outcome = _paginate_query(
-                        query,
-                        max_results=fetch_limit,
-                        offset=fetch_offset,
-                        chunk_size=50,
-                        logger=self.logger,
-                        folder_label=folder_name,
-                    )
-                else:
-                    outcome = _paginate_query_matching(
-                        query,
-                        matcher=text_matcher,
-                        max_results=fetch_limit,
-                        offset=fetch_offset,
-                        chunk_size=50,
-                        logger=self.logger,
-                        folder_label=folder_name,
-                    )
-                ews_call_log(
-                    self.logger, "FindItem",
-                    result_count=len(outcome.items),
-                    total_available=outcome.total_available,
-                    page_offset=fetch_offset,
-                    folder=folder_name,
-                    outcome="ok" if outcome.error_code is None else outcome.error_code,
-                    error_type=(
-                        outcome.error_message.split(":", 1)[0]
-                        if outcome.error_message else None
-                    ),
-                    extra_fields={"tool": "search_emails.advanced"},
-                )
-
-                if outcome.total_available is None:
-                    some_total_unknown = True
-                elif total_available_sum is not None:
-                    total_available_sum += outcome.total_available
-
-                if outcome.error_code:
-                    per_folder_errors.append({
-                        "folder": folder_name,
-                        "error_code": outcome.error_code,
-                        "error_message": outcome.error_message,
-                    })
-
-                per_folder.append((folder_name, outcome.items))
-
-            page, has_more = _merge_folder_page(
-                per_folder,
+            response = self._search_folders(
+                folders,
+                restriction=filters.restriction(),
+                matcher=filters.matcher(),
+                only_fields=only_fields,
                 sort_field=sort_field,
-                descending=sort_order == "descending",
-                skip=offset - fetch_offset,
-                limit=max_results,
+                descending=descending,
+                offset=offset,
+                max_results=max_results,
+                fields=fields,
+                tool="search_emails.advanced",
             )
-            all_results: List[Dict[str, Any]] = [
-                _build_list_item(email, fields=fields, folder_name=name)
-                for name, email in page
-            ]
-
-            # total_available is a sum across folders when every folder
-            # reported a count; None if at least one was unknown.
-            total_available: Optional[int] = (
-                None if some_total_unknown else total_available_sum
-            )
-
-            meta: Dict[str, Any] = {}
-            if per_folder_errors:
-                meta["per_folder_errors"] = per_folder_errors
-
-            response: Dict[str, Any] = {
-                "items": all_results,
-                "count": len(all_results),
-                "total_available": total_available,
-                "folders_searched": search_scope,
-                "mailbox": mailbox,
-            }
-            if has_more:
-                response["next_offset"] = offset + len(all_results)
-            if meta:
-                response["meta"] = meta
-
-            duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
-            ews_call_log(
-                self.logger, "search_emails.advanced_total",
-                duration_ms=duration_ms,
-                result_count=len(all_results),
-                total_available=total_available,
-                page_offset=offset,
-                outcome="ok" if not per_folder_errors else "partial",
-                extra_fields={"folders": len(folders)},
-            )
-
+            response["folders_searched"] = search_scope
+            if all_scope:
+                response.update(_whole_mailbox_report(folders, _folder_errors(response)))
+            response["mailbox"] = mailbox
             return format_success_response(
-                f"Found {len(all_results)} result(s)",
+                f"Found {response['count']} result(s)",
                 **response,
             )
 
-        except ToolExecutionError:
+        except (ValidationError, ToolExecutionError):
             raise
         except Exception as e:
             self.logger.exception(f"Failed to perform advanced search: {e}")
@@ -2211,7 +2661,11 @@ class SearchEmailsTool(BaseTool):
             )
 
     async def _search_full_text(self, **kwargs) -> Dict[str, Any]:
-        """Full-text search across subject, body, and attachment names."""
+        """Full-text search across subject, body, and attachment names.
+
+        The quick-mode filters (sender, recipient, dates, read, flag,
+        attachments, importance, categories, subject/body) narrow it further.
+        """
         target_mailbox = kwargs.get("target_mailbox")
         # Accept both ``query`` (current preferred name) and ``search_query``
         # (legacy schema name some callers are pinned to). If both are set,
@@ -2220,10 +2674,7 @@ class SearchEmailsTool(BaseTool):
         query_text = kwargs.get("query") or kwargs.get("search_query")
         search_scope = kwargs.get("search_scope", ["inbox", "sent"])
         max_results = kwargs.get("max_results", 50)
-        search_in = kwargs.get("search_in", ["subject", "body"])
         exact_phrase = kwargs.get("exact_phrase", False)
-        # Field projection (Bug 6). Default: list-default keys, no body.
-        fields = kwargs.get("fields") or list(LIST_DEFAULT_FIELDS)
 
         if not query_text:
             # ValidationError maps to HTTP 400 in the openapi_adapter; raising
@@ -2232,195 +2683,75 @@ class SearchEmailsTool(BaseTool):
                 "query is required for full_text mode "
                 "(accepted under 'query' or 'search_query')"
             )
+        search_in = kwargs.get("search_in")
+        search_in = _full_text_areas(["subject", "body"] if search_in is None else search_in)
+        filters = _quick_filters(kwargs, free_text=False)
+        if exact_phrase or "attachments" in search_in:
+            # Verified client-side during the scan, not after it, so pages
+            # and totals count real matches. The projection loads what the
+            # check reads, including attachment names but not their content.
+            filters.matchers.insert(0, _full_text_matcher(query_text, search_in))
+            filters.match_fields += tuple(
+                db_field for area in search_in for db_field in _FULL_TEXT_MATCH_FIELDS[area]
+            )
 
         try:
             account = self.get_account(target_mailbox)
             mailbox = self.get_mailbox_info(target_mailbox)
 
-            search_query = query_text.lower()
-
-            folder_map = {
-                "inbox": account.inbox,
-                "sent": account.sent,
-                "drafts": account.drafts,
-                "deleted": account.trash,
-                "junk": account.junk
-            }
-
-            folders_to_search = []
-            for folder_name in search_scope:
-                folder = folder_map.get(folder_name.lower())
-                if folder:
-                    folders_to_search.append(folder)
-
+            folders_to_search, all_scope = await _resolve_search_scope(account, search_scope)
             if not folders_to_search:
                 raise ToolExecutionError("No valid folders to search")
 
-            only_fields = _db_fields_for(fields)
+            # Field projection (Bug 6). Default: list-default keys, no body.
+            fields = _search_fields(kwargs, all_scope=all_scope)
             offset = max(0, int(kwargs.get("offset", 0)))
-            categories = kwargs.get("categories")
-            phrase_matcher = None
-            if exact_phrase:
-                # Exact-phrase check stays client-side: the EWS ``__contains``
-                # filter already narrowed us. Verifying during the scan, not
-                # after it, keeps pages and totals counted in real matches.
-                def phrase_matcher(item):
-                    item_text = ""
-                    if "subject" in search_in:
-                        item_text += (safe_get(item, "subject", "") or "").lower() + " "
-                    if "body" in search_in:
-                        item_text += (safe_get(item, "text_body", "") or "").lower() + " "
-                    if search_query in item_text:
-                        return True
-                    if "attachments" in search_in and hasattr(item, "attachments") and item.attachments:
-                        for att in item.attachments:
-                            if search_query in (safe_get(att, "name", "") or "").lower():
-                                return True
-                    return False
 
-                only_fields = _with_fields(only_fields, *(
-                    db_field for area, db_field in (("subject", "subject"), ("body", "text_body"))
-                    if area in search_in
-                ))
-            # The merge below orders by received time.
-            only_fields = _with_fields(only_fields, "datetime_received")
-            per_folder: List[Tuple[str, List[Any]]] = []
-            per_folder_errors: List[Dict[str, Any]] = []
-            total_available_sum: Optional[int] = 0
-            some_total_unknown = False
-            fetch_offset, fetch_limit = _folder_fetch_window(
-                len(folders_to_search), offset, max_results,
+            # EWS restricts subject and body text but not attachment names,
+            # so the attachments area asks for every message with attachments
+            # and its names are checked locally. Selected areas are ORed; the
+            # other filters must all hold as well.
+            area_filters = {
+                "subject": Q(subject__contains=query_text),
+                "body": Q(body__contains=query_text),
+                "attachments": Q(has_attachments=True),
+            }
+            combined_filter = area_filters[search_in[0]]
+            for area in search_in[1:]:
+                combined_filter |= area_filters[area]
+            other_filters = filters.restriction()
+            if other_filters is not None:
+                combined_filter &= other_filters
+
+            # The merge orders by received time.
+            only_fields = _with_fields(
+                _db_fields_for(fields), *filters.match_fields, "datetime_received",
             )
-            start_time = datetime.now()
-
-            for folder in folders_to_search:
-                folder_name = safe_get(folder, "name", "Unknown")
-                try:
-                    q_filters = []
-                    if "subject" in search_in:
-                        q_filters.append(Q(subject__contains=query_text))
-                    if "body" in search_in:
-                        q_filters.append(Q(body__contains=query_text))
-
-                    if not q_filters:
-                        continue
-
-                    combined_filter = q_filters[0]
-                    for f in q_filters[1:]:
-                        combined_filter |= f
-                    if categories:
-                        # Same restriction as advanced mode: every listed category.
-                        combined_filter &= Q(categories__contains=categories)
-
-                    query = folder.filter(combined_filter).order_by('-datetime_received')
-                    if only_fields:
-                        try:
-                            query = query.only(*only_fields)
-                        except Exception as only_exc:
-                            self.logger.debug(
-                                "query.only(%s) rejected on %s: %s",
-                                only_fields, folder_name, only_exc,
-                            )
-                except Exception as setup_exc:
-                    per_folder_errors.append({
-                        "folder": folder_name,
-                        "error_code": _classify_ews_error(setup_exc),
-                        "error_message": f"{type(setup_exc).__name__}: {setup_exc}",
-                    })
-                    self.logger.warning(
-                        "full-text setup on %s failed: %s: %s",
-                        folder_name, type(setup_exc).__name__, setup_exc,
-                    )
-                    some_total_unknown = True
-                    continue
-
-                if phrase_matcher is None:
-                    outcome = _paginate_query(
-                        query,
-                        max_results=fetch_limit,
-                        offset=fetch_offset,
-                        chunk_size=50,
-                        logger=self.logger,
-                        folder_label=folder_name,
-                    )
-                else:
-                    outcome = _paginate_query_matching(
-                        query,
-                        matcher=phrase_matcher,
-                        max_results=fetch_limit,
-                        offset=fetch_offset,
-                        chunk_size=50,
-                        logger=self.logger,
-                        folder_label=folder_name,
-                    )
-                ews_call_log(
-                    self.logger, "FindItem",
-                    result_count=len(outcome.items),
-                    total_available=outcome.total_available,
-                    page_offset=fetch_offset,
-                    folder=folder_name,
-                    outcome="ok" if outcome.error_code is None else outcome.error_code,
-                    extra_fields={"tool": "search_emails.full_text"},
-                )
-                if outcome.total_available is None:
-                    some_total_unknown = True
-                elif total_available_sum is not None:
-                    total_available_sum += outcome.total_available
-                if outcome.error_code:
-                    per_folder_errors.append({
-                        "folder": folder_name,
-                        "error_code": outcome.error_code,
-                        "error_message": outcome.error_message,
-                    })
-
-                per_folder.append((folder_name, outcome.items))
-
-            page, has_more = _merge_folder_page(
-                per_folder,
+            response = self._search_folders(
+                folders_to_search,
+                restriction=combined_filter,
+                matcher=filters.matcher(),
+                only_fields=only_fields,
                 sort_field="datetime_received",
                 descending=True,
-                skip=offset - fetch_offset,
-                limit=max_results,
+                offset=offset,
+                max_results=max_results,
+                fields=fields,
+                tool="search_emails.full_text",
             )
-            all_results: List[Dict[str, Any]] = [
-                _build_list_item(item, fields=fields, folder_name=name)
-                for name, item in page
-            ]
-
-            total_available: Optional[int] = (
-                None if some_total_unknown else total_available_sum
-            )
-
-            response: Dict[str, Any] = {
-                "items": all_results,
-                "count": len(all_results),
-                "total_available": total_available,
-                "query": query_text,
-                "searched_folders": search_scope,
-                "mailbox": mailbox,
-            }
-            if has_more:
-                response["next_offset"] = offset + len(all_results)
-            if per_folder_errors:
-                response["meta"] = {"per_folder_errors": per_folder_errors}
-
-            duration_ms = int((datetime.now() - start_time).total_seconds() * 1000)
-            ews_call_log(
-                self.logger, "search_emails.full_text_total",
-                duration_ms=duration_ms,
-                result_count=len(all_results),
-                total_available=total_available,
-                page_offset=offset,
-                outcome="ok" if not per_folder_errors else "partial",
-                extra_fields={"folders": len(folders_to_search)},
-            )
-
+            response["query"] = query_text
+            response["searched_folders"] = search_scope
+            if all_scope:
+                response.update(
+                    _whole_mailbox_report(folders_to_search, _folder_errors(response))
+                )
+            response["mailbox"] = mailbox
             return format_success_response(
-                f"Found {len(all_results)} emails matching '{query_text}'",
+                f"Found {response['count']} emails matching '{query_text}'",
                 **response,
             )
 
-        except ToolExecutionError:
+        except (ValidationError, ToolExecutionError):
             raise
         except Exception as e:
             self.logger.exception(f"Failed to perform full-text search: {e}")
@@ -2572,6 +2903,7 @@ class GetEmailDetailsTool(BaseTool):
                 "sent_time": iso_or_none(safe_get(item, "datetime_sent", None))
                 or iso_or_none(safe_get(item, "datetime_received", None)),
                 "is_read": safe_get(item, "is_read", False),
+                "flag_status": _item_flag_status(item),
                 "has_attachments": safe_get(item, "has_attachments", False),
                 "importance": safe_get(item, "importance", "Normal") or "Normal",
                 "attachments": attachment_names,
@@ -3218,6 +3550,26 @@ class ReplyEmailTool(BaseTool):
                         "description": "If true, reply to all recipients; if false, reply only to sender",
                         "default": False
                     },
+                    "cc": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Additional Cc recipients. Added to Cc beside the "
+                            "derived recipients: the sender in To, plus on "
+                            "reply_all the original To in To and the original Cc "
+                            "in Cc. Each address appears once across To, Cc and "
+                            "Bcc, compared case-insensitively."
+                        ),
+                    },
+                    "bcc": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Blind-copy recipients. Bcc holds only these "
+                            "addresses; the original message's Bcc is never "
+                            "copied."
+                        ),
+                    },
                     "attachments": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -3247,6 +3599,8 @@ class ReplyEmailTool(BaseTool):
         target_mailbox = kwargs.get("target_mailbox")
         dry_run = bool(kwargs.get("dry_run", False))
         fetch_files = not dry_run or bool(kwargs.get("verify_files"))
+        extra_cc = address_list(kwargs.get("cc"), "cc")
+        extra_bcc = address_list(kwargs.get("bcc"), "bcc")
 
         if not message_id:
             raise ToolExecutionError("message_id is required")
@@ -3295,13 +3649,16 @@ class ReplyEmailTool(BaseTool):
             reply_subject = add_reply_prefix(original_subject)
 
             # Determine recipients for the reply. Reply-all keeps the original
-            # Cc in Cc rather than promoting it to To.
-            reply_to_list, reply_cc_list, _ = reply_recipients(
+            # Cc in Cc rather than promoting it to To; the caller's cc/bcc are
+            # added on top, as create_reply_draft does.
+            reply_to_list, reply_cc_list, reply_bcc_list = reply_recipients(
                 original_from_email,
                 original_to,
                 original_cc,
                 account.primary_smtp_address,
                 reply_all=reply_all,
+                extra_cc=extra_cc,
+                extra_bcc=extra_bcc,
             )
             if reply_all:
                 self.logger.info(
@@ -3390,6 +3747,8 @@ class ReplyEmailTool(BaseTool):
             )
             if reply_cc_list:
                 message.cc_recipients = [Mailbox(email_address=e) for e in reply_cc_list]
+            if reply_bcc_list:
+                message.bcc_recipients = [Mailbox(email_address=e) for e in reply_bcc_list]
 
             # Set threading headers so reply stays in the same conversation
             original_internet_msg_id = safe_get(original_message, "message_id", None)
@@ -3447,6 +3806,7 @@ class ReplyEmailTool(BaseTool):
                     message_checked=True,
                     would_send_to=reply_to_list,
                     would_cc=reply_cc_list,
+                    would_bcc=reply_bcc_list,
                     subject=reply_subject,
                     original_subject=original_subject,
                     reply_all=reply_all,
@@ -3468,6 +3828,7 @@ class ReplyEmailTool(BaseTool):
                 original_subject=original_subject,
                 reply_to=reply_to_list,
                 cc=reply_cc_list,
+                bcc=reply_bcc_list,
                 reply_all=reply_all,
                 attachments_count=new_attachment_count,
                 inline_attachments_preserved=inline_count,

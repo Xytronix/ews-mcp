@@ -22,10 +22,14 @@ from __future__ import annotations
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Provider-neutral folder aliases understood by every backend.
 WELL_KNOWN_FOLDERS = ("inbox", "sent", "drafts", "trash", "junk", "archive")
+
+#: Folders a whole-mailbox search (``search_scope=["all"]``) leaves out, with
+#: their subfolders, unless the caller names them next to ``"all"``.
+ALL_FOLDERS_EXCLUDED = ("trash", "junk", "drafts", "outbox")
 
 # Body formats accepted/returned by the unified tools (same vocabulary as
 # ``src/body_format.py`` so responses look identical to the EWS tools).
@@ -186,6 +190,9 @@ class MailMessage:
     sent: Optional[str] = None              # ISO-8601
     is_read: bool = False
     is_flagged: bool = False
+    #: "NotFlagged" | "Flagged" | "Complete" (Exchange vocabulary); None when
+    #: the provider did not report the flag
+    flag_status: Optional[str] = None
     has_attachments: bool = False
     importance: Optional[str] = None
     internet_message_id: Optional[str] = None
@@ -227,6 +234,8 @@ class MailMessage:
                 out[key] = value
         if self.is_flagged:
             out["is_flagged"] = True
+        if self.flag_status is not None:
+            out["flag_status"] = self.flag_status
         if self.preview:
             out["preview"] = self.preview
         if self.body is not None:
@@ -283,6 +292,10 @@ class MailBackend(ABC):
 
     #: short provider token, e.g. ``"imap"`` / ``"graph"`` / ``"ews"``
     kind: str = "unknown"
+    #: ``flag_status`` values :meth:`search_messages` can filter on
+    flag_statuses: Tuple[str, ...] = ("NotFlagged", "Flagged")
+    #: whether :meth:`search_all_folders` is implemented
+    supports_all_folder_search: bool = False
 
     def __init__(self, email: str) -> None:
         self.email = email
@@ -328,8 +341,33 @@ class MailBackend(ABC):
         unread_only: bool = False,
         has_attachments: Optional[bool] = None,
         limit: int = 25,
+        flag_status: Optional[str] = None,
     ) -> List[MailMessage]:
-        """Server-side search. ``query`` matches subject/body/participants."""
+        """Server-side search. ``query`` matches subject/body/participants.
+
+        ``flag_status`` is one of :attr:`flag_statuses`.
+        """
+
+    def search_all_folders(
+        self,
+        include: Sequence[str] = (),
+        query: Optional[str] = None,
+        from_address: Optional[str] = None,
+        subject: Optional[str] = None,
+        since: Optional[str] = None,
+        before: Optional[str] = None,
+        unread_only: bool = False,
+        has_attachments: Optional[bool] = None,
+        limit: int = 25,
+        flag_status: Optional[str] = None,
+    ) -> Tuple[List[MailMessage], List[str]]:
+        """Search every mail folder at once, newest first.
+
+        Returns the hits, each with its folder path in ``folder``, and the
+        folder paths covered. :data:`ALL_FOLDERS_EXCLUDED` folders and their
+        subfolders stay out unless ``include`` names them.
+        """
+        raise self._unsupported("search every folder at once", "search one folder per call")
 
     # --- write ----------------------------------------------------------
     @abstractmethod

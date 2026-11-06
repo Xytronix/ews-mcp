@@ -155,6 +155,8 @@ class EWSBackend(MailBackend):
     """MailBackend over Exchange Web Services via the shared :class:`EWSClient`."""
 
     kind = "ews"
+    # Mail search on Exchange goes through search_emails, not this backend.
+    flag_statuses = ()
 
     def __init__(self, account: MailAccount, ews_client: "EWSClient") -> None:
         super().__init__(account.email)
@@ -560,6 +562,7 @@ class EWSBackend(MailBackend):
         unread_only: bool = False,
         has_attachments: Optional[bool] = None,
         limit: int = 25,
+        flag_status: Optional[str] = None,
     ) -> List[MailMessage]:
         """Server-side search.
 
@@ -568,6 +571,11 @@ class EWSBackend(MailBackend):
         (unfiltered newest-first). Free-text therefore uses a Restriction:
         ``Q(subject__icontains) | Q(body__contains)``.
         """
+        if flag_status:
+            raise self._unsupported(
+                "filter by flag_status",
+                "search_emails filters Exchange mail by flag_status",
+            )
         try:
             ews_folder = self._folder(folder)
             query = (query or "").strip() or None

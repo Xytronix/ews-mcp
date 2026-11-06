@@ -3,7 +3,9 @@ from __future__ import annotations
 
 from datetime import timezone
 
+from ..exceptions import ValidationError
 from ..mail_backends.base import MailBackendError
+from ..mail_backends.calendar_rules import CalendarRuleError
 from . import calendar_tools as exchange
 from .mailbox_tools import RoutedMailTool
 from ..mail_backends.graph_calendar import _datetime
@@ -24,26 +26,49 @@ def _reject_attachments(kwargs):
         raise MailBackendError("Calendar inline_attachments are Exchange-only; Graph calendar attachment upload is not supported by this tool")
 
 
+async def _call(tool, func, **kwargs):
+    """Run a calendar backend call; bad recurrence/reminder/scope input is a ValidationError."""
+    try:
+        return await tool.call(func, **kwargs)
+    except CalendarRuleError as exc:
+        raise ValidationError(str(exc)) from exc
+
+
+def _note(schema, name, text):
+    prop = schema["inputSchema"]["properties"][name]
+    prop["description"] = prop.get("description", "") + text
+    return schema
+
+
 class CreateAppointmentTool(RoutedMailTool, exchange.CreateAppointmentTool):
+    def get_schema(self):
+        return _note(super().get_schema(), "recurrence", " CalDAV/iCloud mailboxes reject recurrence.")
+
     async def execute_routed(self, account, backend, **kwargs):
         _require_calendar(account)
         _reject_attachments(kwargs)
-        result = await self.call(backend.create_appointment, **{k: v for k, v in kwargs.items() if k != "inline_attachments"})
+        result = await _call(self, backend.create_appointment, **{k: v for k, v in kwargs.items() if k != "inline_attachments"})
         return self.routed_response("Appointment created successfully", account, result)
 
 
 class GetCalendarTool(RoutedMailTool, exchange.GetCalendarTool):
     async def execute_routed(self, account, backend, **kwargs):
         _require_calendar(account)
-        result = await self.call(backend.get_calendar, **kwargs)
+        result = await _call(self, backend.get_calendar, **kwargs)
         return self.routed_response(f"Retrieved {len(result['events'])} events", account, result)
 
 
 class UpdateAppointmentTool(RoutedMailTool, exchange.UpdateAppointmentTool):
+    def get_schema(self):
+        return _note(super().get_schema(), "scope", (
+            " CalDAV/iCloud: a recurring event is one resource for the whole series, so its "
+            "item_id needs scope='series', and its start/end cannot be changed."
+        ))
+
     async def execute_routed(self, account, backend, **kwargs):
         _require_calendar(account)
         _reject_attachments(kwargs)
-        result = await self.call(backend.update_appointment, **{k: v for k, v in kwargs.items() if k != "inline_attachments"})
+        result = await _call(self, backend.update_appointment, **{k: v for k, v in kwargs.items() if k != "inline_attachments"})
         return self.routed_response("Appointment updated successfully", account, result)
 
 
@@ -54,11 +79,14 @@ class DeleteAppointmentTool(RoutedMailTool, exchange.DeleteAppointmentTool):
             ". Graph cannot suppress cancellation for organizer meetings; false is rejected in that case. "
             "Deleting an attendee's copy does not cancel the meeting."
         )
-        return schema
+        return _note(schema, "scope", (
+            " CalDAV/iCloud: a recurring event is one resource for the whole series, so its "
+            "item_id needs scope='series'."
+        ))
 
     async def execute_routed(self, account, backend, **kwargs):
         _require_calendar(account)
-        result = await self.call(backend.delete_appointment, **kwargs)
+        result = await _call(self, backend.delete_appointment, **kwargs)
         return self.routed_response("Appointment deleted successfully", account, result)
 
 

@@ -1,15 +1,270 @@
 """Calendar operation tools for EWS MCP Server."""
 
 import logging
-from typing import Any, Dict, Optional
-from datetime import datetime, timedelta
-from exchangelib import CalendarItem, Mailbox, Attendee
+from typing import Any, Dict, List, Optional, Tuple
+from datetime import date, datetime, timedelta
+from exchangelib import CalendarItem, EWSDate, Mailbox, Attendee
+from exchangelib.fields import MONTHS, WEEK_NUMBERS, WEEKDAYS as EWS_WEEKDAYS
 from exchangelib.items import SEND_TO_ALL_AND_SAVE_COPY, SEND_TO_NONE
+from exchangelib.items.calendar_item import EXCEPTION as EWS_EXCEPTION
+from exchangelib.items.calendar_item import OCCURRENCE as EWS_OCCURRENCE
+from exchangelib.items.calendar_item import RECURRING_MASTER, SINGLE as EWS_SINGLE
+from exchangelib.properties import RecurringMasterItemId
+from exchangelib.recurrence import (
+    AbsoluteMonthlyPattern,
+    AbsoluteYearlyPattern,
+    DailyPattern,
+    EndDatePattern,
+    NumberedPattern,
+    Recurrence,
+    RelativeMonthlyPattern,
+    RelativeYearlyPattern,
+    WeeklyPattern,
+)
 
 from .base import BaseTool
+from ..mail_backends.calendar_rules import (
+    EXCEPTION,
+    OCCURRENCE,
+    PATTERNS,
+    SERIES_MASTER,
+    SINGLE,
+    WEEK_OF_MONTH,
+    WEEKDAYS,
+    CalendarRuleError,
+    describe_recurrence,
+    normalize_recurrence,
+    normalize_reminder,
+    normalize_scope,
+    require_series_first_date,
+    series_target,
+)
 from ..models import CreateAppointmentRequest, MeetingResponse
 from ..exceptions import ToolExecutionError, ValidationError
 from ..utils import format_success_response, safe_get, parse_datetime_tz_aware, make_tz_aware, format_datetime, ews_id_to_str, attach_inline_files, find_message_for_account, INLINE_ATTACHMENTS_SCHEMA, get_timezone as get_configured_timezone
+
+
+# ---------------------------------------------------------------- series
+# Input schemas shared by the Exchange tools and their Graph/CalDAV routes.
+RECURRENCE_SCHEMA = {
+    "type": "object",
+    "description": (
+        "Repeat the appointment. start_time/end_time are the first occurrence; the "
+        "series keeps that wall-clock time across DST changes in the configured "
+        "TIMEZONE. Day fields default to start_time and must agree with it. "
+        "Without until or count the series has no end."
+    ),
+    "properties": {
+        "pattern": {"type": "string", "enum": list(PATTERNS)},
+        "interval": {
+            "type": "integer", "minimum": 1, "default": 1,
+            "description": (
+                "Every N days (up to 999), weeks or months (up to 99). Exchange "
+                "yearly patterns only support 1; use monthly with 12*N instead."
+            ),
+        },
+        "weekdays": {
+            "type": "array", "items": {"type": "string", "enum": list(WEEKDAYS)},
+            "description": "weekly: days of the week, including start_time's day. Default: start_time's day.",
+        },
+        "day_of_month": {
+            "type": "integer", "minimum": 1, "maximum": 31,
+            "description": "monthly/yearly: day of the month. Default: start_time's day.",
+        },
+        "week_of_month": {
+            "type": "string", "enum": list(WEEK_OF_MONTH),
+            "description": "monthly/yearly: with weekday, a relative day such as the second Tuesday.",
+        },
+        "weekday": {
+            "type": "string", "enum": list(WEEKDAYS),
+            "description": "monthly/yearly: the day for week_of_month. Default: start_time's day.",
+        },
+        "month": {
+            "type": "integer", "minimum": 1, "maximum": 12,
+            "description": "yearly: month number. Default: start_time's month.",
+        },
+        "until": {"type": "string", "description": "Last possible date of the series, YYYY-MM-DD."},
+        "count": {"type": "integer", "minimum": 1, "maximum": 999, "description": "Number of occurrences."},
+    },
+    "required": ["pattern"],
+    "additionalProperties": False,
+}
+
+SCOPE_SCHEMA = {
+    "type": "string",
+    "enum": ["occurrence", "series"],
+    "description": (
+        "For recurring events. An occurrence id from get_calendar acts on that "
+        "occurrence only. A series master id is refused unless scope='series'; "
+        "scope='series' with an occurrence id acts on its whole series."
+    ),
+}
+
+_EWS_ITEM_TYPES = {
+    EWS_SINGLE: SINGLE,
+    EWS_OCCURRENCE: OCCURRENCE,
+    EWS_EXCEPTION: EXCEPTION,
+    RECURRING_MASTER: SERIES_MASTER,
+}
+
+# update_appointment inputs that change a field of the item.
+_UPDATE_FIELDS = ("subject", "start_time", "end_time", "location", "body", "categories", "reminder_minutes")
+
+
+def _item_kind(item) -> Optional[str]:
+    """get_calendar's type for an exchangelib CalendarItem (None if EWS sent none)."""
+    return _EWS_ITEM_TYPES.get(safe_get(item, "type", None))
+
+
+def _reminder_minutes(item) -> Optional[int]:
+    if not safe_get(item, "reminder_is_set", False):
+        return None
+    return safe_get(item, "reminder_minutes_before_start", None)
+
+
+def build_ews_recurrence(rule: Dict[str, Any]) -> Recurrence:
+    """exchangelib Recurrence for a rule from ``normalize_recurrence``.
+
+    exchangelib numbers weekdays, week numbers and months from 1, in the
+    same order as the rule's names (Monday..Sunday, first..last).
+    """
+    pattern, interval = rule["pattern"], rule["interval"]
+    weekday = WEEKDAYS.index(rule["weekday"]) + 1 if rule.get("weekday") else None
+    week = WEEK_OF_MONTH.index(rule["week_of_month"]) + 1 if rule.get("week_of_month") else None
+    if pattern == "daily":
+        ews_pattern = DailyPattern(interval=interval)
+    elif pattern == "weekly":
+        ews_pattern = WeeklyPattern(
+            interval=interval,
+            weekdays=[WEEKDAYS.index(day) + 1 for day in rule["weekdays"]],
+            first_day_of_week=1,
+        )
+    elif pattern == "monthly" and week:
+        ews_pattern = RelativeMonthlyPattern(interval=interval, weekday=weekday, week_number=week)
+    elif pattern == "monthly":
+        ews_pattern = AbsoluteMonthlyPattern(interval=interval, day_of_month=rule["day_of_month"])
+    elif interval != 1:
+        # EWS yearly patterns carry no interval at all.
+        raise CalendarRuleError(
+            "Exchange yearly recurrence has no interval; for every N years use "
+            "pattern 'monthly' with interval 12*N"
+        )
+    elif week:
+        ews_pattern = RelativeYearlyPattern(weekday=weekday, week_number=week, month=rule["month"])
+    else:
+        ews_pattern = AbsoluteYearlyPattern(day_of_month=rule["day_of_month"], month=rule["month"])
+    # EWSDate.from_date() rejects date subclasses such as EWSDate itself.
+    start = EWSDate(*rule["start_date"].timetuple()[:3])
+    if rule.get("until"):
+        return Recurrence(pattern=ews_pattern, start=start, end=EWSDate(*rule["until"].timetuple()[:3]))
+    if rule.get("count"):
+        return Recurrence(pattern=ews_pattern, start=start, number=rule["count"])
+    return Recurrence(pattern=ews_pattern, start=start)
+
+
+def _ews_name(value, names) -> str:
+    """exchangelib returns enum values as 1-based numbers or as names."""
+    return (names[value - 1] if isinstance(value, int) else str(value)).lower()
+
+
+def _as_date(value) -> Optional[date]:
+    if isinstance(value, datetime):
+        return value.date()
+    return value if isinstance(value, date) else None
+
+
+def rule_from_ews(recurrence) -> Optional[Dict[str, Any]]:
+    """Read an exchangelib Recurrence back into the tools' rule shape."""
+    if recurrence is None:
+        return None
+    pattern = recurrence.pattern
+    if isinstance(pattern, DailyPattern):
+        rule: Dict[str, Any] = {"pattern": "daily", "interval": pattern.interval}
+    elif isinstance(pattern, WeeklyPattern):
+        days = pattern.weekdays if isinstance(pattern.weekdays, (list, tuple)) else [pattern.weekdays]
+        rule = {"pattern": "weekly", "interval": pattern.interval,
+                "weekdays": [_ews_name(day, EWS_WEEKDAYS) for day in days]}
+    elif isinstance(pattern, AbsoluteMonthlyPattern):
+        rule = {"pattern": "monthly", "interval": pattern.interval, "day_of_month": pattern.day_of_month}
+    elif isinstance(pattern, RelativeMonthlyPattern):
+        rule = {"pattern": "monthly", "interval": pattern.interval,
+                "week_of_month": _ews_name(pattern.week_number, WEEK_NUMBERS),
+                "weekday": _ews_name(pattern.weekday, EWS_WEEKDAYS)}
+    elif isinstance(pattern, (AbsoluteYearlyPattern, RelativeYearlyPattern)):
+        month = pattern.month if isinstance(pattern.month, int) else MONTHS.index(pattern.month) + 1
+        rule = {"pattern": "yearly", "interval": 1, "month": month}
+        if isinstance(pattern, AbsoluteYearlyPattern):
+            rule["day_of_month"] = pattern.day_of_month
+        else:
+            rule["week_of_month"] = _ews_name(pattern.week_number, WEEK_NUMBERS)
+            rule["weekday"] = _ews_name(pattern.weekday, EWS_WEEKDAYS)
+    else:
+        rule = {"pattern": "other", "description": str(pattern)}
+    boundary = recurrence.boundary
+    rule["start_date"] = _as_date(getattr(boundary, "start", None))
+    if isinstance(boundary, EndDatePattern):
+        rule["until"] = _as_date(boundary.end)
+    elif isinstance(boundary, NumberedPattern):
+        rule["count"] = boundary.number
+    return rule
+
+
+def fetch_series_master(account, occurrence):
+    """The recurring master of an occurrence or exception, with all fields."""
+    master_id = RecurringMasterItemId(id=occurrence.id, changekey=occurrence.changekey)
+    master = next(iter(account.fetch(ids=[master_id], folder=account.calendar)), None)
+    if master is None or isinstance(master, Exception):
+        raise ToolExecutionError(f"Could not load the series of this occurrence: {master}")
+    return master
+
+
+def load_series_masters(account, occurrences, with_rule: bool) -> Tuple[List[Any], Optional[str]]:
+    """The recurring masters of ``occurrences``, aligned with them, in one GetItem.
+
+    A CalendarView expands every series into occurrences and never returns
+    the master, and an occurrence id does not reveal the master's id. EWS
+    resolves it through RecurringMasterItemId. Fetching only the id (plus
+    the rule when asked) keeps this one small batch per get_calendar call.
+    A failure is reported as a warning instead of failing the listing.
+    """
+    if not occurrences:
+        return [], None
+    ids = [RecurringMasterItemId(id=item.id, changekey=item.changekey) for item in occurrences]
+    try:
+        fetched = list(account.fetch(
+            ids=ids, folder=account.calendar, only_fields=["recurrence"] if with_rule else [],
+        ))
+    except Exception as exc:
+        return [None] * len(occurrences), f"Could not load the series masters of recurring events: {exc}"
+    masters = [None if isinstance(master, Exception) else master for master in fetched]
+    masters += [None] * (len(occurrences) - len(masters))
+    failed = sum(master is None for master in masters)
+    warning = f"Could not load the series master of {failed} recurring event(s)" if failed else None
+    return masters, warning
+
+
+def _series_first_date(master) -> Optional[date]:
+    """Local date of the series' first occurrence (the master's own start)."""
+    start = safe_get(master, "start", None)
+    if isinstance(start, datetime):
+        return start.astimezone(get_configured_timezone()).date()
+    if isinstance(start, date):
+        return start
+    return _as_date(getattr(getattr(safe_get(master, "recurrence", None), "boundary", None), "start", None))
+
+
+def _series_guard(item, scope: Optional[str]) -> bool:
+    """series_target() for an exchangelib item, as a ValidationError with a hint."""
+    try:
+        return series_target(_item_kind(item), scope)
+    except CalendarRuleError as exc:
+        raise ValidationError(
+            str(exc),
+            hint=(
+                "get_calendar lists occurrences with their own item_id and the "
+                "series_master_id of their series."
+            ),
+        ) from exc
 
 
 def build_free_busy_accounts(email_addresses):
@@ -123,7 +378,10 @@ class CreateAppointmentTool(BaseTool):
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "create_appointment",
-            "description": "Create a calendar appointment or meeting with attendees.",
+            "description": (
+                "Create a calendar appointment or meeting with attendees; with "
+                "recurrence, a recurring series whose item_id is the series master."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -158,10 +416,16 @@ class CreateAppointmentTool(BaseTool):
                         "default": False
                     },
                     "reminder_minutes": {
-                        "type": "integer",
-                        "description": "Reminder minutes before (optional)",
+                        "type": ["integer", "null"],
+                        "minimum": 0,
+                        "description": (
+                            "Reminder this many minutes before the start "
+                            "(0 = at the start). Default 15. null = no reminder."
+                        ),
                         "default": 15
                     },
+                    # A copy: routed tools append provider notes to it.
+                    "recurrence": {**RECURRENCE_SCHEMA},
                     "categories": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -190,6 +454,20 @@ class CreateAppointmentTool(BaseTool):
         # Validate input
         request = self.validate_input(CreateAppointmentRequest, **kwargs)
 
+        # start_time is an EWSDateTime in the configured TIMEZONE, which
+        # exchangelib also writes as the item's StartTimeZone/EndTimeZone. A
+        # series therefore repeats at that zone's wall-clock time across DST
+        # changes even when the caller passed a fixed offset such as +01:00.
+        try:
+            reminder = normalize_reminder(request.reminder_minutes)
+            rule = None
+            ews_recurrence = None
+            if kwargs.get("recurrence") is not None:
+                rule = normalize_recurrence(kwargs["recurrence"], request.start_time.date())
+                ews_recurrence = build_ews_recurrence(rule)
+        except CalendarRuleError as exc:
+            raise ValidationError(str(exc)) from exc
+
         try:
             target_mailbox = kwargs.get("target_mailbox")
             account = self.get_account(target_mailbox)
@@ -212,9 +490,13 @@ class CreateAppointmentTool(BaseTool):
             if request.body:
                 item.body = request.body
 
-            if request.reminder_minutes is not None:
-                item.reminder_is_set = True
-                item.reminder_minutes_before_start = request.reminder_minutes
+            # reminder_minutes=null asks for no reminder; omitted keeps 15.
+            item.reminder_is_set = reminder is not None
+            if reminder is not None:
+                item.reminder_minutes_before_start = reminder
+
+            if ews_recurrence is not None:
+                item.recurrence = ews_recurrence
 
             # Add attendees
             if request.attendees:
@@ -251,6 +533,9 @@ class CreateAppointmentTool(BaseTool):
                 subject=request.subject,
                 start_time=request.start_time.isoformat(),
                 end_time=request.end_time.isoformat(),
+                type=SERIES_MASTER if rule else SINGLE,
+                reminder_minutes=reminder,
+                recurrence=describe_recurrence(rule),
                 mailbox=mailbox
             )
 
@@ -265,7 +550,12 @@ class GetCalendarTool(BaseTool):
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "get_calendar",
-            "description": "Retrieve calendar events for a date range.",
+            "description": (
+                "Retrieve calendar events for a date range. Each event reports its "
+                "type (single, occurrence or exception; series are expanded into "
+                "occurrences), series_master_id for occurrences and exceptions, and "
+                "reminder_minutes (null when no reminder is set)."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -289,6 +579,15 @@ class GetCalendarTool(BaseTool):
                         "description": "Maximum number of events to retrieve",
                         "default": 50,
                         "maximum": 1000
+                    },
+                    "include_recurrence": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Add recurrence (pattern, interval, days, end and a "
+                            "readable summary) to occurrences and exceptions, read "
+                            "from their series master; null for single events."
+                        )
                     },
                     "target_mailbox": {
                         "type": "string",
@@ -330,6 +629,7 @@ class GetCalendarTool(BaseTool):
                 end_date = start_date + timedelta(days=days_ahead)
 
             max_results = kwargs.get("max_results", 50)
+            include_recurrence = bool(kwargs.get("include_recurrence", False))
 
             # Query calendar - use only() to fetch specific fields and avoid timezone parsing warnings
             items = account.calendar.view(
@@ -337,12 +637,18 @@ class GetCalendarTool(BaseTool):
                 end=end_date
             ).only(
                 'id', 'subject', 'start', 'end', 'location',
-                'organizer', 'is_all_day', 'required_attendees'
+                'organizer', 'is_all_day', 'required_attendees',
+                'type', 'reminder_is_set', 'reminder_minutes_before_start'
             ).order_by('start')
+            items = list(items[:max_results])
+
+            recurring = [item for item in items if _item_kind(item) in (OCCURRENCE, EXCEPTION)]
+            masters, warning = load_series_masters(account, recurring, include_recurrence)
+            pending_masters = iter(masters)
 
             # Format events
             events = []
-            for item in items[:max_results]:
+            for item in items:
                 # Get organizer email safely
                 organizer = safe_get(item, "organizer", None)
                 organizer_email = ""
@@ -357,6 +663,8 @@ class GetCalendarTool(BaseTool):
                     if att and hasattr(att, "mailbox") and att.mailbox and hasattr(att.mailbox, "email_address") and att.mailbox.email_address
                 ]
 
+                kind = _item_kind(item)
+                master = next(pending_masters) if kind in (OCCURRENCE, EXCEPTION) else None
                 event_data = {
                     "item_id": ews_id_to_str(safe_get(item, "id", None)) or "unknown",
                     "subject": safe_get(item, "subject", "") or "",
@@ -365,18 +673,27 @@ class GetCalendarTool(BaseTool):
                     "location": safe_get(item, "location", "") or "",
                     "organizer": organizer_email,
                     "is_all_day": safe_get(item, "is_all_day", False),
-                    "attendees": attendee_emails
+                    "attendees": attendee_emails,
+                    "type": kind,
+                    "series_master_id": ews_id_to_str(safe_get(master, "id", None)) if master is not None else None,
+                    "reminder_minutes": _reminder_minutes(item),
                 }
+                if include_recurrence:
+                    event_data["recurrence"] = describe_recurrence(
+                        rule_from_ews(safe_get(master, "recurrence", None)) if master is not None else None
+                    )
                 events.append(event_data)
 
             self.logger.info(f"Retrieved {len(events)} calendar events")
 
+            extra = {"warnings": [warning]} if warning else {}
             return format_success_response(
                 f"Retrieved {len(events)} events",
                 events=events,
                 start_date=start_date.isoformat(),
                 end_date=end_date.isoformat(),
-                mailbox=mailbox
+                mailbox=mailbox,
+                **extra
             )
 
         except Exception as e:
@@ -390,7 +707,12 @@ class UpdateAppointmentTool(BaseTool):
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "update_appointment",
-            "description": "Update an existing calendar appointment.",
+            "description": (
+                "Update an existing calendar appointment. An occurrence id changes "
+                "that occurrence only; a series master id needs scope='series', which "
+                "changes the whole series and overwrites those fields on occurrences "
+                "changed individually before."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -426,6 +748,21 @@ class UpdateAppointmentTool(BaseTool):
                             "this list (Issue #114). Pass an empty list to clear."
                         )
                     },
+                    "reminder_minutes": {
+                        "type": ["integer", "null"],
+                        "minimum": 0,
+                        "description": (
+                            "Set or change the reminder, in minutes before the start "
+                            "(0 = at the start). null removes the reminder; omit to keep it."
+                        )
+                    },
+                    "scope": {
+                        **SCOPE_SCHEMA,
+                        "description": SCOPE_SCHEMA["description"] + (
+                            " With 'series', start_time/end_time may change the time of "
+                            "day but must stay on the series' first date."
+                        ),
+                    },
                     **INLINE_ATTACHMENTS_SCHEMA,
                     "target_mailbox": {
                         "type": "string",
@@ -441,12 +778,58 @@ class UpdateAppointmentTool(BaseTool):
         item_id = kwargs.get("item_id")
 
         try:
+            scope = normalize_scope(kwargs.get("scope"))
+            reminder = normalize_reminder(kwargs["reminder_minutes"]) if "reminder_minutes" in kwargs else None
+        except CalendarRuleError as exc:
+            raise ValidationError(str(exc)) from exc
+        # save(update_fields=None) would push every writable field back to the
+        # server, so a call that changes nothing is refused before any request.
+        # attach_inline_files() skips entries without a name or content.
+        attachments = [
+            att for att in kwargs.get("inline_attachments") or []
+            if isinstance(att, dict) and att.get("file_name") and att.get("file_content")
+        ]
+        if not attachments and not any(key in kwargs for key in _UPDATE_FIELDS):
+            raise ValidationError(
+                "nothing to update: pass subject, start_time, end_time, location, body, "
+                "categories, reminder_minutes or inline_attachments"
+            )
+        new_times = {}
+        for key in ("start_time", "end_time"):
+            if key in kwargs:
+                new_times[key] = parse_datetime_tz_aware(kwargs[key])
+                if new_times[key] is None:
+                    raise ValidationError(f"{key} must be an ISO 8601 datetime")
+
+        try:
             target_mailbox = kwargs.get("target_mailbox")
             account = self.get_account(target_mailbox)
             mailbox = self.get_mailbox_info(target_mailbox)
 
             # Get the appointment
             item = account.calendar.get(id=item_id)
+
+            # An occurrence id updates that occurrence only (EWS turns it
+            # into an exception). A master id rewrites every occurrence, so
+            # it needs the explicit scope; scope='series' on an occurrence id
+            # resolves its master.
+            series_master_id = None
+            if _series_guard(item, scope):
+                item = fetch_series_master(account, item)
+                series_master_id = ews_id_to_str(item.id)
+            kind = _item_kind(item)
+            if kind == SERIES_MASTER and new_times:
+                first_date = _series_first_date(item)
+                if first_date is None:
+                    raise ValidationError(
+                        "Exchange returned no start for this series, so start_time/end_time "
+                        "cannot be checked against its first date"
+                    )
+                try:
+                    for key, value in new_times.items():
+                        require_series_first_date(key, value.date(), first_date)
+                except CalendarRuleError as exc:
+                    raise ValidationError(str(exc)) from exc
 
             # Track the fields actually touched: a bare save() makes
             # exchangelib update every writable CalendarItem field, which
@@ -458,12 +841,12 @@ class UpdateAppointmentTool(BaseTool):
                 item.subject = kwargs["subject"]
                 changed_fields.append("subject")
 
-            if "start_time" in kwargs:
-                item.start = parse_datetime_tz_aware(kwargs["start_time"])
+            if "start_time" in new_times:
+                item.start = new_times["start_time"]
                 changed_fields.append("start")
 
-            if "end_time" in kwargs:
-                item.end = parse_datetime_tz_aware(kwargs["end_time"])
+            if "end_time" in new_times:
+                item.end = new_times["end_time"]
                 changed_fields.append("end")
 
             if "location" in kwargs:
@@ -479,7 +862,15 @@ class UpdateAppointmentTool(BaseTool):
                 item.categories = list(kwargs["categories"] or [])
                 changed_fields.append("categories")
 
-            # Add inline (base64) attachments if provided
+            if "reminder_minutes" in kwargs:
+                item.reminder_is_set = reminder is not None
+                changed_fields.append("reminder_is_set")
+                if reminder is not None:
+                    item.reminder_minutes_before_start = reminder
+                    changed_fields.append("reminder_minutes_before_start")
+
+            # Add inline (base64) attachments if provided. On a saved item
+            # exchangelib creates them on the server right away.
             inline_count = attach_inline_files(item, kwargs.get("inline_attachments", []))
             if inline_count > 0:
                 self.logger.info(f"Added {inline_count} inline (base64) attachment(s) to appointment")
@@ -490,21 +881,36 @@ class UpdateAppointmentTool(BaseTool):
                 (safe_get(item, "required_attendees", []) or [])
                 or (safe_get(item, "optional_attendees", []) or [])
             )
-            item.save(
-                update_fields=changed_fields or None,
-                send_meeting_invitations=(
-                    SEND_TO_ALL_AND_SAVE_COPY if has_attendees else SEND_TO_NONE
-                ),
-            )
+            extra = {"series_master_id": series_master_id} if series_master_id else {}
+            if changed_fields:
+                item.save(
+                    update_fields=changed_fields,
+                    send_meeting_invitations=(
+                        SEND_TO_ALL_AND_SAVE_COPY if has_attendees else SEND_TO_NONE
+                    ),
+                )
+            elif has_attendees:
+                # Only attachments were added. EWS sends a meeting update only
+                # with a field change, and there is none to make.
+                extra["note"] = (
+                    "Attachments were added; no meeting update was sent because no "
+                    "other field changed."
+                )
 
             self.logger.info(f"Updated appointment {item_id}")
 
             return format_success_response(
                 "Appointment updated successfully",
                 item_id=item_id,
-                mailbox=mailbox
+                type=kind,
+                updated_fields=changed_fields,
+                attachments_added=inline_count,
+                mailbox=mailbox,
+                **extra
             )
 
+        except ValidationError:
+            raise
         except Exception as e:
             self.logger.error(f"Failed to update appointment: {e}")
             raise ToolExecutionError(f"Failed to update appointment: {e}")
@@ -516,7 +922,10 @@ class DeleteAppointmentTool(BaseTool):
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "delete_appointment",
-            "description": "Delete a calendar appointment.",
+            "description": (
+                "Delete a calendar appointment. An occurrence id deletes that "
+                "occurrence only; a series master id needs scope='series'."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -528,6 +937,12 @@ class DeleteAppointmentTool(BaseTool):
                         "type": "boolean",
                         "description": "Send cancellation to attendees (for meetings)",
                         "default": True
+                    },
+                    "scope": {
+                        **SCOPE_SCHEMA,
+                        "description": SCOPE_SCHEMA["description"] + (
+                            " With 'series', the whole series is deleted (or cancelled)."
+                        ),
                     },
                     "target_mailbox": {
                         "type": "string",
@@ -542,6 +957,10 @@ class DeleteAppointmentTool(BaseTool):
         """Delete appointment."""
         item_id = kwargs.get("item_id")
         send_cancellation = kwargs.get("send_cancellation", True)
+        try:
+            scope = normalize_scope(kwargs.get("scope"))
+        except CalendarRuleError as exc:
+            raise ValidationError(str(exc)) from exc
 
         try:
             target_mailbox = kwargs.get("target_mailbox")
@@ -551,6 +970,15 @@ class DeleteAppointmentTool(BaseTool):
             # Get and delete the appointment
             item = account.calendar.get(id=item_id)
 
+            # Deleting or cancelling an occurrence id affects that occurrence
+            # only; a master id would remove the whole series, so it needs
+            # the explicit scope.
+            series_master_id = None
+            if _series_guard(item, scope):
+                item = fetch_series_master(account, item)
+                series_master_id = ews_id_to_str(item.id)
+            kind = _item_kind(item)
+
             # Cancel when anyone was invited — optional attendees are
             # attendees too, and only cancel() notifies them.
             has_attendees = bool(
@@ -558,19 +986,26 @@ class DeleteAppointmentTool(BaseTool):
                 or (safe_get(item, "optional_attendees", []) or [])
             )
 
-            if send_cancellation and has_attendees:
+            cancelled = bool(send_cancellation and has_attendees)
+            if cancelled:
                 item.cancel()
             else:
                 item.delete()
 
             self.logger.info(f"Deleted appointment {item_id}")
 
+            extra = {"series_master_id": series_master_id} if series_master_id else {}
             return format_success_response(
                 "Appointment deleted successfully",
                 item_id=item_id,
-                mailbox=mailbox
+                type=kind,
+                cancellation_sent=cancelled,
+                mailbox=mailbox,
+                **extra
             )
 
+        except ValidationError:
+            raise
         except Exception as e:
             self.logger.error(f"Failed to delete appointment: {e}")
             raise ToolExecutionError(f"Failed to delete appointment: {e}")

@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..exceptions import ToolExecutionError, ValidationError
 from ..mail_backends.accounts import MailAccount
 from ..mail_backends.base import (
+    ALL_FOLDERS_EXCLUDED,
     BODY_FORMATS,
     WELL_KNOWN_FOLDERS,
     MailBackend,
@@ -68,6 +69,11 @@ from .email_tools import (
     SearchEmailsTool as _ExchangeSearchEmailsTool,
     SendEmailTool as _ExchangeSendEmailTool,
     UpdateEmailTool as _ExchangeUpdateEmailTool,
+    address_list as _as_list,
+    normalize_flag_status,
+    reject_other_mode_params,
+    search_mode,
+    search_param_is_default,
 )
 from .email_tools_draft import (
     CreateDraftTool as _ExchangeCreateDraftTool,
@@ -152,24 +158,6 @@ _CLEANUP_ON_FAILURE = {
         "a caller-supplied draft or a draft whose submission is uncertain."
     ),
 }
-
-
-def _as_list(value: Any, field: str) -> List[str]:
-    """Accept a list, or a comma/semicolon separated string, of addresses."""
-    if value in (None, "", []):
-        return []
-    if isinstance(value, str):
-        parts = [p.strip() for p in value.replace(";", ",").split(",")]
-        return [p for p in parts if p]
-    if isinstance(value, (list, tuple)):
-        out: List[str] = []
-        for item in value:
-            if isinstance(item, str) and item.strip():
-                out.append(item.strip())
-            elif item is not None and not isinstance(item, str):
-                raise ValidationError(f"{field} must contain e-mail address strings")
-        return out
-    raise ValidationError(f"{field} must be a string or an array of strings")
 
 
 def _clamp(value: Any, low: int, high: int, default: int) -> int:
@@ -528,7 +516,7 @@ class SearchEmailsTool(RoutedMailTool, _ExchangeSearchEmailsTool):
     async def execute_routed(self, account, backend, **kwargs) -> Dict[str, Any]:
         self._validate_kwargs(kwargs)
 
-        mode = (kwargs.get("mode") or "quick").strip().lower()
+        mode = search_mode(kwargs)
         if mode == "advanced":
             raise ValidationError(
                 f"mode='advanced': not supported for {account.email} "
@@ -536,9 +524,12 @@ class SearchEmailsTool(RoutedMailTool, _ExchangeSearchEmailsTool):
                 f"multi-folder sorting, categories and importance are "
                 f"Exchange-only. Use mode='quick' or mode='full_text'."
             )
+        reject_other_mode_params(kwargs, mode)
+        # Schema defaults (which some clients fill in) request nothing.
+        explicit = {k: v for k, v in kwargs.items() if not search_param_is_default(k, v)}
         self.reject_exchange_only(
             account,
-            kwargs,
+            explicit,
             (
                 "to_address",
                 "recipient",
@@ -550,60 +541,104 @@ class SearchEmailsTool(RoutedMailTool, _ExchangeSearchEmailsTool):
                 "exact_phrase",
             ),
         )
-        if (kwargs.get("sort_by") or "datetime_received") != "datetime_received" or (
-            kwargs.get("sort_order") or "descending"
-        ) != "descending":
+        if "sort_by" in explicit or "sort_order" in explicit:
             raise ValidationError(
                 f"sort_by / sort_order: not supported for {account.email} "
                 f"({account.provider}) — results are always newest-first."
+            )
+        if kwargs.get("is_read") is True:
+            raise ValidationError(
+                f"is_read=true: not supported for {account.email} "
+                f"({account.provider} over {account.kind.upper()}) — only "
+                f"is_read=false (unread mail) can be searched for."
+            )
+        flag_status = normalize_flag_status(kwargs.get("flag_status"))
+        if flag_status and flag_status not in backend.flag_statuses:
+            raise ValidationError(
+                f"flag_status={flag_status!r}: not supported for {account.email} "
+                f"({account.provider} over {account.kind.upper()}), which can only "
+                f"filter on {' or '.join(backend.flag_statuses)}."
             )
 
         scope = kwargs.get("search_scope") or []
         if isinstance(scope, str):
             scope = [scope]
-        if len(scope) > 1:
+        names = [str(name).strip() for name in scope]
+        all_folders = any(name.lower() == "all" for name in names)
+        # A folder or scope equal to its schema default (inbox) yields to the
+        # other; two real choices contradict each other.
+        folder_named = normalize_folder(kwargs.get("folder")) != "inbox"
+        scoped = [normalize_folder(name) for name in names] not in ([], ["inbox"])
+        if folder_named and scoped:
+            raise ValidationError(
+                "folder and search_scope name different folders; pass one of them."
+            )
+        include: List[str] = []
+        if all_folders:
+            if not backend.supports_all_folder_search:
+                raise ValidationError(
+                    f"search_scope=['all']: not supported for {account.email} "
+                    f"({account.provider} over {account.kind.upper()}) — search "
+                    f"one folder per call."
+                )
+            for name in names:
+                token = normalize_folder(name).lower()
+                if token in ALL_FOLDERS_EXCLUDED:
+                    include.append(token)
+                elif token not in ("all", "inbox", "sent"):
+                    raise ValidationError(
+                        f"search_scope: {name!r} cannot be combined with 'all', "
+                        f"which already covers every mail folder; next to 'all' "
+                        f"name only {', '.join(ALL_FOLDERS_EXCLUDED)} to search "
+                        f"those as well."
+                    )
+        elif len(scope) > 1:
             raise ValidationError(
                 f"search_scope with {len(scope)} folders: not supported for "
                 f"{account.email} ({account.provider}) — search one folder "
-                f"per call."
+                f"per call, or the whole mailbox with search_scope=['all']."
             )
-        folder = normalize_folder(kwargs.get("folder") or (scope[0] if scope else None))
 
-        query = (
-            kwargs.get("query")
-            or kwargs.get("search_query")
-            or kwargs.get("keywords")
-            or None
-        )
+        query = kwargs.get("query") or kwargs.get("search_query") or None
         is_read = kwargs.get("is_read")
         has_attachments = kwargs.get("has_attachments")
         limit = _clamp(kwargs.get("max_results"), 1, 1000, 50)
         offset = _clamp(kwargs.get("offset"), 0, 100000, 0)
-
-        messages = await self.call(
-            backend.search_messages,
-            folder,
-            query,
-            kwargs.get("from_address") or kwargs.get("sender") or None,
-            kwargs.get("subject_contains") or None,
-            kwargs.get("start_date") or None,
-            kwargs.get("end_date") or None,
-            is_read is False,
-            None if has_attachments is None else bool(has_attachments),
-            limit + offset,
+        criteria = dict(
+            query=query,
+            from_address=kwargs.get("from_address") or kwargs.get("sender") or None,
+            subject=kwargs.get("subject_contains") or None,
+            since=kwargs.get("start_date") or None,
+            before=kwargs.get("end_date") or None,
+            unread_only=is_read is False,
+            has_attachments=None if has_attachments is None else bool(has_attachments),
+            limit=limit + offset,
+            flag_status=flag_status,
         )
+
+        response: Dict[str, Any] = {}
+        if all_folders:
+            messages, searched = await self.call(
+                backend.search_all_folders, include, **criteria,
+            )
+            response["folders_searched"] = searched
+        else:
+            folder = normalize_folder(
+                kwargs.get("folder") if folder_named else (scope[0] if scope else None)
+            )
+            messages = await self.call(backend.search_messages, folder, **criteria)
+            response["folder"] = folder
         page = messages[offset : offset + limit]
         fields = kwargs.get("fields")
         items = [
             project_fields(m.to_dict(), fields) if fields else m.to_dict() for m in page
         ]
 
-        response: Dict[str, Any] = {
+        response.update({
             "items": items,
             "count": len(items),
             "total_available": len(messages),
-            "folder": folder,
-        }
+        })
         if len(messages) > offset + len(items):
             response["next_offset"] = offset + len(items)
         return self.routed_response(
@@ -767,6 +802,8 @@ class ReplyEmailTool(RoutedMailTool, _ExchangeReplyEmailTool):
             to=[],
             body=body,
             body_format=_body_format(kwargs.get("body_format"), "html"),
+            cc=_as_list(kwargs.get("cc"), "cc"),
+            bcc=_as_list(kwargs.get("bcc"), "bcc"),
             reply_to_message_id=message_id,
             reply_to_folder=normalize_folder(kwargs.get("folder")),
             reply_all=bool(kwargs.get("reply_all", False)),
@@ -776,6 +813,8 @@ class ReplyEmailTool(RoutedMailTool, _ExchangeReplyEmailTool):
         )
         if dry_run:
             # The original is not read here: an IMAP fetch could flip \Seen.
+            # So the preview names the caller's copies only; the provider
+            # derives the rest when the reply is sent.
             return self.routed_response(
                 "Dry run - no reply sent",
                 account,
@@ -784,6 +823,13 @@ class ReplyEmailTool(RoutedMailTool, _ExchangeReplyEmailTool):
                 replying_to=message_id,
                 reply_all=outgoing.reply_all,
                 message_checked=False,
+                would_cc=outgoing.cc,
+                would_bcc=outgoing.bcc,
+                recipients_note=(
+                    "would_cc and would_bcc are your additions. Sending also "
+                    "addresses the original sender and, on reply_all, the "
+                    "original To and Cc, listing nobody twice."
+                ),
                 would_attach=len(entries),
                 **dry_run_file_report(entries, loaded),
             )
