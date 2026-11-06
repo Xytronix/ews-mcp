@@ -12,6 +12,7 @@ from ..exceptions import ValidationError, ToolExecutionError
 from ..utils import format_error_response
 from ..logging_system import get_logger
 from ..middleware.circuit_breaker import get_circuit_breaker
+from ..middleware.logging import redact_sensitive
 
 
 class BaseTool(ABC):
@@ -52,7 +53,37 @@ class BaseTool(ABC):
 
     def get_account(self, target_mailbox: Optional[str] = None) -> Account:
         """Get Exchange account for operations."""
+        self.require_exchange_mailbox(target_mailbox)
         return self.ews_client.get_account(target_mailbox)
+
+    def require_exchange_mailbox(self, target_mailbox: Optional[str] = None) -> None:
+        """Refuse an Exchange-only operation aimed at an IMAP/Graph mailbox.
+
+        Every EWS code path reaches Exchange through :meth:`get_account`, so
+        this one check keeps the Exchange-only tools (calendar, contacts,
+        tasks, rules, OOF, meetings, drafts, ...) honest: they say what is
+        unsupported instead of silently operating on — or pretending to
+        operate on — a mailbox they cannot reach. The mail-CRUD and
+        attachment tools never get here for a non-Exchange mailbox; they
+        route to that mailbox's backend first (see
+        ``mailbox_tools.RoutedMailTool``).
+        """
+        if not target_mailbox:
+            return
+        try:
+            account = self.ews_client.mailbox_registry.find_account(target_mailbox)
+        except Exception:  # registry unavailable -> keep legacy behaviour
+            return
+        if account is None or account.kind == "ews":
+            return
+        from .mailbox_tools import ROUTED_TOOL_NAMES
+
+        raise ToolExecutionError(
+            f"{account.email} is a {account.provider} mailbox served over "
+            f"{account.kind.upper()}; '{self.get_schema()['name']}' is "
+            f"Exchange-only. Tools that work with this mailbox: "
+            f"{', '.join(ROUTED_TOOL_NAMES)}."
+        )
 
     def get_mailbox_info(self, target_mailbox: Optional[str] = None) -> str:
         """Get mailbox identifier for response."""
@@ -96,8 +127,16 @@ class BaseTool(ABC):
             context={"tool": tool_name}
         )
 
+        failure_result = None
         try:
             result = await self.execute(**kwargs)
+            if result.get("success") is False:
+                # Routed multi-step failures already carry recovery metadata.
+                # Run the normal failure accounting without discarding that
+                # response or treating a returned error as a successful call.
+                failure_result = result
+                error_class = ValidationError if result.get("error_type") == "ValidationError" else ToolExecutionError
+                raise error_class(result.get("error") or "Tool returned a failure")
             duration_ms = int((time.time() - start_time) * 1000)
 
             # Record success with circuit breaker
@@ -140,7 +179,7 @@ class BaseTool(ABC):
             duration_ms = int((time.time() - start_time) * 1000)
             # Validation errors are user errors — don't trip circuit breaker
             self._log_error("ValidationError", tool_name, module_name, kwargs, e, duration_ms)
-            return format_error_response(e, "")
+            return failure_result if failure_result is not None else format_error_response(e, "")
 
         except ToolExecutionError as e:
             duration_ms = int((time.time() - start_time) * 1000)
@@ -149,7 +188,7 @@ class BaseTool(ABC):
             if any(kw in error_str for kw in ["connect", "timeout", "unavailable", "transport"]):
                 cb.record_failure()
             self._log_error("ToolExecutionError", tool_name, module_name, kwargs, e, duration_ms)
-            return format_error_response(e, "")
+            return failure_result if failure_result is not None else format_error_response(e, "")
 
         except Exception as e:
             duration_ms = int((time.time() - start_time) * 1000)
@@ -192,17 +231,9 @@ class BaseTool(ABC):
         )
 
     def _sanitize_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        """Sanitize kwargs for logging (remove sensitive data)."""
-        sanitized = {}
-        sensitive_keys = ['password', 'secret', 'token', 'api_key', 'body', 'content']
+        """Sanitize kwargs for logging (remove sensitive data).
 
-        for key, value in kwargs.items():
-            if any(sensitive in key.lower() for sensitive in sensitive_keys):
-                if isinstance(value, str) and len(value) > 50:
-                    sanitized[key] = f"{value[:50]}... (truncated)"
-                else:
-                    sanitized[key] = "***REDACTED***"
-            else:
-                sanitized[key] = value
-
-        return sanitized
+        Recursive, so base64 inside ``files=[{file_content: ...}]`` (or an
+        alias such as ``content``/``data``) never reaches the activity log.
+        """
+        return redact_sensitive(kwargs)

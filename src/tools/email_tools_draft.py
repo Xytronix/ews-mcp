@@ -13,7 +13,7 @@ from .email_tools import (
     copy_attachments_to_message,
 )
 from ..models import SendEmailRequest
-from ..exceptions import ToolExecutionError
+from ..exceptions import ToolExecutionError, ValidationError
 from ..utils import (
     format_success_response,
     safe_get,
@@ -27,6 +27,32 @@ from ..utils import (
 )
 from ..body_format import compose_body, WRITE_FORMAT_SCHEMA as BODY_FORMAT_SCHEMA
 from .email_tools import add_reply_prefix, add_forward_prefix
+from .outgoing_attachments import (
+    FILES_SCHEMA, load_outgoing_files, attach_outgoing_files, save_draft_with_attachments,
+)
+from .smartermail_base import smartermail_client
+from .attachment_tools import extract_attachment_id, attachment_content_type
+
+
+def _draft_metadata(message):
+    """Saved identities, including persisted attachment IDs, without file bytes."""
+    attachments = []
+    for attachment in message.attachments or []:
+        name = safe_get(attachment, "name", "")
+        attachments.append({
+            "attachment_id": extract_attachment_id(attachment),
+            "name": name,
+            "size": safe_get(attachment, "size", None),
+            "content_type": attachment_content_type(attachment, name),
+            "is_inline": bool(safe_get(attachment, "is_inline", False)),
+            "content_id": safe_get(attachment, "content_id", None),
+        })
+    return {
+        "id": ews_id_to_str(message.id),
+        "folder": "drafts",
+        "backend": "ews",
+        "attachments": attachments,
+    }
 
 
 class CreateDraftTool(BaseTool):
@@ -35,7 +61,7 @@ class CreateDraftTool(BaseTool):
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "create_draft",
-            "description": "Create a draft email in the Drafts folder for review before sending. The draft appears in OWA/Outlook and can be edited and sent manually.",
+            "description": "Create an Exchange-only draft for review, optionally including files. Returns message_id. Review/edit it in your mail client, or send it unchanged with send_email(draft_id=<message_id>, target_mailbox=...). Do not pass compose fields when sending the saved draft.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -70,14 +96,16 @@ class CreateDraftTool(BaseTool):
                     "attachments": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Attachment file paths (optional)"
+                        "description": "Exchange-only server-local file paths; prefer files for URL or base64 sources."
                     },
                     **INLINE_ATTACHMENTS_SCHEMA,
+                    "files": FILES_SCHEMA,
                     "categories": {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Outlook categories to attach to the draft (Issue #114)."
                     },
+                    **BODY_FORMAT_SCHEMA,
                     "target_mailbox": {
                         "type": "string",
                         "description": "Email address to create draft on behalf of (requires impersonation/delegate access)"
@@ -91,11 +119,16 @@ class CreateDraftTool(BaseTool):
         """Create draft email via EWS and save to Drafts folder."""
         target_mailbox = kwargs.pop("target_mailbox", None)
         categories = kwargs.pop("categories", None)
+        body_format = kwargs.pop("body_format", "html")
         request = self.validate_input(SendEmailRequest, **kwargs)
 
         try:
             account = self.get_account(target_mailbox)
             mailbox = self.get_mailbox_info(target_mailbox)
+            files = await load_outgoing_files(
+                kwargs.get("files"),
+                storage_client=lambda: smartermail_client(self.ews_client, target_mailbox),
+            )
 
             email_body = request.body.strip()
 
@@ -105,6 +138,9 @@ class CreateDraftTool(BaseTool):
 
             if not email_body:
                 raise ToolExecutionError("Email body is empty after processing")
+            if body_format != "html":
+                email_body, _ = compose_body(email_body, body_format)
+
 
             is_html = bool(re.search(r'<[^>]+>', email_body))
 
@@ -158,9 +194,10 @@ class CreateDraftTool(BaseTool):
             # Add inline attachments
             inline_count = attach_inline_files(message, kwargs.get("inline_attachments", []))
             attachment_count += inline_count
+            attachment_count += attach_outgoing_files(message, files)
 
             # Save as draft instead of sending
-            message.save()
+            save_draft_with_attachments(message)
 
             self.logger.info(f"Draft saved for {', '.join(request.to)} with {attachment_count} attachment(s)")
 
@@ -170,7 +207,8 @@ class CreateDraftTool(BaseTool):
                 created_time=datetime.now().isoformat(),
                 recipients=request.to,
                 subject=request.subject,
-                mailbox=mailbox
+                mailbox=mailbox,
+                **_draft_metadata(message),
             )
 
         except Exception as e:
@@ -184,7 +222,7 @@ class CreateReplyDraftTool(BaseTool):
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "create_reply_draft",
-            "description": "Create a reply draft in the Drafts folder for review before sending.",
+            "description": "Create an Exchange-only reply draft for review. Returns message_id. Review/edit it in your mail client, or send it unchanged with send_email(draft_id=<message_id>, target_mailbox=...). Do not pass compose fields when sending the saved draft.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -204,9 +242,10 @@ class CreateReplyDraftTool(BaseTool):
                     "attachments": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "File paths to attach to the draft reply (optional)"
+                        "description": "Exchange-only server-local file paths; prefer files for URL or base64 sources."
                     },
                     **INLINE_ATTACHMENTS_SCHEMA,
+                    "files": FILES_SCHEMA,
                     "cc": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -265,6 +304,10 @@ class CreateReplyDraftTool(BaseTool):
         try:
             account = self.get_account(target_mailbox)
             mailbox = self.get_mailbox_info(target_mailbox)
+            files = await load_outgoing_files(
+                kwargs.get("files"),
+                storage_client=lambda: smartermail_client(self.ews_client, target_mailbox),
+            )
 
             original_message = find_message_for_account(account, message_id)
             original_subject = safe_get(original_message, "subject", "") or ""
@@ -352,8 +395,8 @@ class CreateReplyDraftTool(BaseTool):
             if categories:
                 message.categories = list(categories)
 
-            inline_count, _ = copy_attachments_to_message(original_message, message)
-            attachment_count = 0
+            inline_count, regular_count = copy_attachments_to_message(original_message, message)
+            attachment_count = inline_count + regular_count
 
             for file_path in attachments:
                 try:
@@ -371,9 +414,9 @@ class CreateReplyDraftTool(BaseTool):
 
             inline_b64_count = attach_inline_files(message, kwargs.get("inline_attachments", []))
             attachment_count += inline_b64_count
-            attachment_count += inline_count
+            attachment_count += attach_outgoing_files(message, files)
 
-            message.save()
+            save_draft_with_attachments(message)
             draft_message_id = ews_id_to_str(message.id)
             reply_to = header.get("from", "")
 
@@ -394,7 +437,8 @@ class CreateReplyDraftTool(BaseTool):
                 attachments_count=attachment_count,
                 inline_attachments_preserved=inline_count,
                 created_time=datetime.now().isoformat(),
-                mailbox=mailbox
+                mailbox=mailbox,
+                **_draft_metadata(message),
             )
 
         except ToolExecutionError:
@@ -410,7 +454,7 @@ class CreateForwardDraftTool(BaseTool):
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "create_forward_draft",
-            "description": "Create a forward draft in the Drafts folder for review before sending.",
+            "description": "Create an Exchange-only forward draft for review. Returns message_id. Review/edit it in your mail client, or send it unchanged with send_email(draft_id=<message_id>, target_mailbox=...). Do not pass compose fields when sending the saved draft.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -440,9 +484,10 @@ class CreateForwardDraftTool(BaseTool):
                     "attachments": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Additional file paths to attach to the draft (optional)"
+                        "description": "Exchange-only server-local file paths; prefer files for URL or base64 sources."
                     },
                     **INLINE_ATTACHMENTS_SCHEMA,
+                    "files": FILES_SCHEMA,
                     "categories": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -483,6 +528,10 @@ class CreateForwardDraftTool(BaseTool):
         try:
             account = self.get_account(target_mailbox)
             mailbox = self.get_mailbox_info(target_mailbox)
+            files = await load_outgoing_files(
+                kwargs.get("files"),
+                storage_client=lambda: smartermail_client(self.ews_client, target_mailbox),
+            )
 
             original_message = find_message_for_account(account, message_id)
             original_subject = safe_get(original_message, "subject", "") or ""
@@ -556,8 +605,9 @@ class CreateForwardDraftTool(BaseTool):
 
             inline_b64_count = attach_inline_files(message, kwargs.get("inline_attachments", []))
             additional_attachment_count += inline_b64_count
+            additional_attachment_count += attach_outgoing_files(message, files)
 
-            message.save()
+            save_draft_with_attachments(message)
             draft_message_id = ews_id_to_str(message.id)
 
             self.logger.info(f"Forward draft saved for message {message_id} in mailbox: {mailbox}")
@@ -575,7 +625,8 @@ class CreateForwardDraftTool(BaseTool):
                 inline_attachments_preserved=inline_count,
                 additional_attachments=additional_attachment_count,
                 created_time=datetime.now().isoformat(),
-                mailbox=mailbox
+                mailbox=mailbox,
+                **_draft_metadata(message),
             )
 
         except ToolExecutionError:
@@ -583,3 +634,83 @@ class CreateForwardDraftTool(BaseTool):
         except Exception as e:
             self.logger.error(f"Failed to create forward draft: {e}")
             raise ToolExecutionError(f"Failed to create forward draft: {e}")
+
+
+class UpdateDraftTool(BaseTool):
+    """Partially update a saved draft without replacing its recipients or files."""
+
+    def get_schema(self) -> Dict[str, Any]:
+        return {
+            "name": "update_draft",
+            "description": (
+                "Update a saved draft's subject and/or body. Omitted fields are preserved; "
+                "empty strings clear them. Recipients and attachments are preserved. "
+                "Use the returned message_id for subsequent operations."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "draft_id": {"type": "string", "description": "Saved draft message ID"},
+                    "subject": {"type": "string", "description": "New subject; empty clears"},
+                    "body": {"type": "string", "description": "New body; empty clears"},
+                    "body_format": {
+                        "type": "string", "enum": ["markdown", "html", "text"],
+                        "default": "markdown",
+                    },
+                    "target_mailbox": {"type": "string", "description": "Mailbox containing the draft"},
+                },
+                "required": ["draft_id"],
+            },
+        }
+
+    @staticmethod
+    def validate_update(kwargs):
+        draft_id = kwargs.get("draft_id")
+        if not isinstance(draft_id, str) or not draft_id.strip():
+            raise ValidationError("draft_id is required")
+        for field in ("subject", "body"):
+            if field in kwargs and not isinstance(kwargs[field], str):
+                raise ValidationError(f"{field} must be a string; omit it to preserve its value")
+        body_format = kwargs.get("body_format", "markdown")
+        if body_format not in ("markdown", "html", "text"):
+            raise ValidationError("body_format must be markdown, html or text")
+        return draft_id.strip(), body_format
+
+    async def execute(self, **kwargs) -> Dict[str, Any]:
+        draft_id, body_format = self.validate_update(kwargs)
+        target_mailbox = kwargs.get("target_mailbox")
+        account = self.get_account(target_mailbox)
+        try:
+            # Restrict fetched fields too: avoid MIME conversion and never fetch
+            # recipients/attachments merely to send them back in an update.
+            message = next(iter(account.fetch(
+                ids=[(draft_id, None)], only_fields=("is_draft", "subject", "body"),
+            )), None)
+            if isinstance(message, Exception):
+                raise message
+            if message is None:
+                raise ToolExecutionError(f"Draft not found: {draft_id}")
+            if not message.is_draft:
+                raise ToolExecutionError("update_draft requires a draft; sent messages cannot be edited")
+            changed = []
+            if "subject" in kwargs:
+                message.subject = kwargs["subject"]
+                changed.append("subject")
+            if "body" in kwargs:
+                body = kwargs["body"]
+                html, _actual = compose_body(body, body_format)
+                message.body = HTMLBody(html if body else "")
+                changed.append("body")
+            if changed:
+                message.save(update_fields=changed)
+            saved_id = ews_id_to_str(message.id)
+            return format_success_response(
+                "Draft updated" if changed else "Draft unchanged",
+                id=saved_id, message_id=saved_id, draft_id=saved_id,
+                folder="drafts", backend="ews", mailbox=self.get_mailbox_info(target_mailbox),
+                updated_fields=changed,
+            )
+        except ToolExecutionError:
+            raise
+        except Exception as exc:
+            raise ToolExecutionError(f"Failed to update draft: {exc}") from exc

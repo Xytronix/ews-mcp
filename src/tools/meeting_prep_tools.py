@@ -18,7 +18,7 @@ from datetime import timedelta
 from typing import Any, Dict, List, Optional
 
 from .base import BaseTool
-from .attachment_tools import ReadAttachmentTool
+from ..document_parser import parse_document_bytes, supports_liteparse
 from ..exceptions import ToolExecutionError
 from ..memory import CommitmentRepo, NS
 from ..utils import (
@@ -298,19 +298,15 @@ class PrepareMeetingTool(BaseTool):
         """
         name = safe_get(att, "name", "") or ""
         ext = name.lower().rsplit(".", 1)[-1] if "." in name else ""
-        if ext not in ("pdf", "docx", "xlsx", "xls"):
+        if not supports_liteparse(ext):
             return None
         try:
             content = safe_get(att, "content", b"") or b""
             if not content:
                 return None
-            reader = ReadAttachmentTool(self.ews_client)
-            if ext == "pdf":
-                text = reader._read_pdf(content, extract_tables=False, max_pages=2)
-            elif ext == "docx":
-                text = reader._read_docx(content, extract_tables=False)
-            else:
-                text = reader._read_excel(content)
+            text = parse_document_bytes(
+                content, ext, max_pages=2, extract_tables=False
+            )
             return truncate_text(text, 500)
         except Exception:
             return None

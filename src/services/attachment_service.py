@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ..core.attachment import Attachment, AttachmentContent, AttachmentType
 from ..utils import safe_get
+from ..attachment_parsers import extract_attachment_text
 
 
 class AttachmentService:
@@ -14,10 +15,7 @@ class AttachmentService:
     Service for handling all attachment formats.
 
     Supports:
-    - PDF (with pdfplumber)
-    - DOCX (with python-docx)
-    - Excel (with openpyxl)
-    - PPTX (with python-pptx)
+    - PDF, DOCX, Excel, PPTX, images (via Liteparse + OCR)
     - ZIP archives
     - Plain text
     - HTML
@@ -91,27 +89,11 @@ class AttachmentService:
                 )
 
             # Parse based on type
-            if attachment.attachment_type == AttachmentType.DOCUMENT:
-                if attachment.extension == '.pdf':
-                    return await self._parse_pdf(attachment, content, extract_text, extract_images, max_pages)
-                elif attachment.extension in ['.docx', '.doc']:
-                    return await self._parse_docx(attachment, content, extract_text, extract_images)
-                elif attachment.extension in ['.txt', '.rtf']:
-                    return await self._parse_text(attachment, content)
-
-            elif attachment.attachment_type == AttachmentType.SPREADSHEET:
-                if attachment.extension in ['.xlsx', '.xls']:
-                    return await self._parse_excel(attachment, content)
-                elif attachment.extension == '.csv':
-                    return await self._parse_csv(attachment, content)
-
-            elif attachment.attachment_type == AttachmentType.PRESENTATION:
-                if attachment.extension in ['.pptx', '.ppt']:
-                    return await self._parse_pptx(attachment, content, extract_text, extract_images)
-
-            elif attachment.attachment_type == AttachmentType.ARCHIVE:
-                if attachment.extension == '.zip':
-                    return await self._parse_zip(attachment, content)
+            ext = (attachment.extension or '').lstrip('.').lower()
+            if ext:
+                return await self._parse_with_extractors(
+                    attachment, content, ext, extract_text, max_pages
+                )
 
             # Default: return raw content info
             return AttachmentContent(
@@ -140,162 +122,34 @@ class AttachmentService:
                 continue
         return None
 
-    async def _parse_pdf(
+    async def _parse_with_extractors(
         self,
         attachment: Attachment,
         content: bytes,
+        ext: str,
         extract_text: bool,
-        extract_images: bool,
-        max_pages: int
+        max_pages: int,
     ) -> AttachmentContent:
-        """Parse PDF file."""
+        """Parse attachments via the shared read_attachment extractors."""
+        import asyncio
+
+        result = AttachmentContent(attachment=attachment, format=ext)
         try:
-            import pdfplumber
-
-            result = AttachmentContent(attachment=attachment, format='pdf')
-
-            with pdfplumber.open(io.BytesIO(content)) as pdf:
-                # Extract text
-                if extract_text:
-                    pages_to_process = min(len(pdf.pages), max_pages)
-                    text_parts = []
-                    for i in range(pages_to_process):
-                        page_text = pdf.pages[i].extract_text() or ''
-                        text_parts.append(page_text)
-
-                    result.text = '\n\n'.join(text_parts)
-
-                # Extract tables
-                result.tables = []
-                for i in range(min(len(pdf.pages), max_pages)):
-                    tables = pdf.pages[i].extract_tables()
-                    if tables:
-                        result.tables.extend(tables)
-
-                # Metadata
-                if pdf.metadata:
-                    result.metadata = {
-                        'pages': len(pdf.pages),
-                        'author': pdf.metadata.get('Author'),
-                        'title': pdf.metadata.get('Title'),
-                        'created': str(pdf.metadata.get('CreationDate')),
-                    }
-
-            result.success = True
-            return result
-
-        except ImportError:
-            return AttachmentContent(
-                attachment=attachment,
-                success=False,
-                error="pdfplumber not installed. Install with: pip install pdfplumber"
-            )
-        except Exception as e:
-            return AttachmentContent(
-                attachment=attachment,
-                success=False,
-                error=f"Failed to parse PDF: {str(e)}"
-            )
-
-    async def _parse_docx(
-        self,
-        attachment: Attachment,
-        content: bytes,
-        extract_text: bool,
-        extract_images: bool
-    ) -> AttachmentContent:
-        """Parse DOCX file."""
-        try:
-            from docx import Document
-
-            result = AttachmentContent(attachment=attachment, format='docx')
-
-            doc = Document(io.BytesIO(content))
-
-            # Extract text
             if extract_text:
-                paragraphs = [para.text for para in doc.paragraphs]
-                result.text = '\n\n'.join(paragraphs)
-
-            # Extract tables
-            result.tables = []
-            for table in doc.tables:
-                table_data = [
-                    [cell.text for cell in row.cells]
-                    for row in table.rows
-                ]
-                result.tables.append(table_data)
-
-            # Metadata
-            result.metadata = {
-                'author': doc.core_properties.author,
-                'title': doc.core_properties.title,
-                'created': str(doc.core_properties.created),
-                'modified': str(doc.core_properties.modified),
-            }
-
+                result.text = await asyncio.to_thread(
+                    extract_attachment_text,
+                    content,
+                    ext,
+                    max_pages=max_pages,
+                    extract_tables=True,
+                )
             result.success = True
             return result
-
-        except ImportError:
-            return AttachmentContent(
-                attachment=attachment,
-                success=False,
-                error="python-docx not installed. Install with: pip install python-docx"
-            )
         except Exception as e:
             return AttachmentContent(
                 attachment=attachment,
                 success=False,
-                error=f"Failed to parse DOCX: {str(e)}"
-            )
-
-    async def _parse_excel(
-        self,
-        attachment: Attachment,
-        content: bytes
-    ) -> AttachmentContent:
-        """Parse Excel file."""
-        try:
-            from openpyxl import load_workbook
-
-            result = AttachmentContent(attachment=attachment, format='excel')
-
-            wb = load_workbook(io.BytesIO(content), data_only=True)
-
-            # Extract all sheets
-            result.sheets = {}
-            for sheet_name in wb.sheetnames:
-                sheet = wb[sheet_name]
-                sheet_data = []
-                for row in sheet.iter_rows(values_only=True):
-                    sheet_data.append(list(row))
-                result.sheets[sheet_name] = sheet_data
-
-            # Try to extract first sheet as structured data
-            if wb.sheetnames:
-                first_sheet = wb[wb.sheetnames[0]]
-                headers = [cell.value for cell in first_sheet[1]]
-
-                result.structured_data = []
-                for row in first_sheet.iter_rows(min_row=2, values_only=True):
-                    row_dict = dict(zip(headers, row))
-                    result.structured_data.append(row_dict)
-
-            result.success = True
-            return result
-
-        except ImportError:
-            return AttachmentContent(
-                attachment=attachment,
-                success=False,
-                error="openpyxl not installed. Install with: pip install openpyxl"
-            )
-        except Exception as e:
-            return AttachmentContent(
-                attachment=attachment,
-                success=False,
-                error=f"Failed to parse Excel: {str(e)}"
+                error=f"Failed to parse attachment: {e}",
             )
 
     async def _parse_text(

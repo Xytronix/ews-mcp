@@ -18,12 +18,18 @@ _SENSITIVE_KEY_PATTERNS: tuple = (
     "inline_attachments",
 )
 
+#: Exact (not substring) keys: attachment-source aliases that carry base64
+#: but are too generic for substring matching ("data" is in "metadata").
+_SENSITIVE_EXACT_KEYS = frozenset({"content", "base64", "data"})
+
 
 def _is_sensitive(key: str) -> bool:
     # Normalise hyphens to underscores so header-style spellings
     # (`X-API-Key`, `Auth-Token`) match the same patterns as snake_case
     # field names (`api_key`, `auth_token`).
     lower = str(key).lower().replace("-", "_")
+    if lower in _SENSITIVE_EXACT_KEYS:
+        return True
     return any(pattern in lower for pattern in _SENSITIVE_KEY_PATTERNS)
 
 

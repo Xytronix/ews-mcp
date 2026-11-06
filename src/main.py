@@ -30,10 +30,14 @@ from .utils import safe_json_dumps
 
 # Import all tool classes (67 total: 63 base + 4 optional AI)
 from .tools import (
-    CreateDraftTool, CreateReplyDraftTool, CreateForwardDraftTool,
+    CreateDraftTool, CreateReplyDraftTool, CreateForwardDraftTool, UpdateDraftTool,
     SendEmailTool, ReadEmailsTool, SearchEmailsTool, GetEmailDetailsTool, GetEmailsBulkTool,
     DeleteEmailTool, MoveEmailTool, UpdateEmailTool, CopyEmailTool,
     ReplyEmailTool, ForwardEmailTool,
+    # Mailbox inventory (1). read/search/get/send/reply/move/delete/update
+    # and list_folders above serve Exchange, iCloud/IMAP and Outlook/Graph
+    # through one set of names (see tools/mailbox_tools.py).
+    ListMailboxesTool,
     # Calendar tools (7)
     CreateAppointmentTool, GetCalendarTool, UpdateAppointmentTool,
     DeleteAppointmentTool, RespondToMeetingTool, CheckAvailabilityTool,
@@ -43,10 +47,11 @@ from .tools import (
     # Task tools (5)
     CreateTaskTool, GetTasksTool, UpdateTaskTool,
     CompleteTaskTool, DeleteTaskTool,
-    # Attachment tools (7)
+    # Attachment tools (9, incl. outbound staging)
     ListAttachmentsTool, DownloadAttachmentTool,
     AddAttachmentTool, DeleteAttachmentTool, ReadAttachmentTool,
     GetEmailMimeTool, AttachEmailToDraftTool,
+    StageOutgoingFileTool, DeleteStagedFileTool,
     # Search tools (1) — advanced_search/full_text_search merged into search_emails
     SearchByConversationTool,
     # Folder tools (3) — create/delete/rename/move merged into manage_folder
@@ -81,6 +86,18 @@ from .tools import (
     # Compound tools (2) — return structured context, no LLM call
     GenerateBriefingTool, PrepareMeetingTool,
 )
+
+# SmarterMail private-REST tool groups. Each module owns its own area and
+# exports the tool classes it registers; they are gated as a block by
+# SMARTERMAIL_ENABLED (and the admin group additionally by
+# SMARTERMAIL_ADMIN_TOOLS).
+from .tools.smartermail_mail_tools import SMARTERMAIL_TOOLS as SM_MAIL_TOOLS
+from .tools.smartermail_settings_tools import SMARTERMAIL_TOOLS as SM_SETTINGS_TOOLS
+from .tools.smartermail_calendar_contacts_tools import (
+    SMARTERMAIL_TOOLS as SM_CALENDAR_CONTACT_TOOLS,
+)
+from .tools.smartermail_workspace_tools import SMARTERMAIL_TOOLS as SM_WORKSPACE_TOOLS
+from .tools.smartermail_admin_tools import SMARTERMAIL_TOOLS as SM_ADMIN_TOOLS
 
 
 # Errors that indicate the Exchange connection pool simply wasn't
@@ -381,6 +398,63 @@ def _enable_tcp_keepalive(
             logger.debug("SIO_KEEPALIVE_VALS failed: %s", exc)
 
 
+STAGE_UPLOAD_MAX_BYTES = 25 * 1024 * 1024
+
+
+async def _handle_stage_upload(scope, receive, send, send_json) -> None:
+    """``POST /stage`` — raw-body upload into the outbound staging area.
+
+    Enabled only when ``STAGE_UPLOAD_TOKEN`` is set; requires
+    ``Authorization: Bearer <token>``. Headers: ``X-File-Name`` (required,
+    URL-encoded allowed), ``Content-Type``; query ``ttl_seconds``. Returns
+    the same dict as ``stage_outgoing_file`` (staging_id, file_path, ...),
+    usable as ``files=[{"file_path": ...}]`` on create_draft/send_email.
+    """
+    import json as _json
+    from urllib.parse import parse_qs, unquote
+    from .attachment_staging import stage_bytes, clamp_ttl
+    from .exceptions import ValidationError as _VE
+
+    token = (os.environ.get("STAGE_UPLOAD_TOKEN") or "").strip()
+    if not token:
+        await send_json(send, 404, b'{"success":false,"error":"Not Found"}')
+        return
+    if scope.get("method") != "POST":
+        await send_json(send, 405, b'{"success":false,"error":"POST only"}')
+        return
+    headers = scope.get("headers") or []
+    if not _authorized_request(headers, token, None):
+        await send_json(send, 401, b'{"success":false,"error":"Unauthorized"}')
+        return
+    hdr = {k.decode("latin-1").lower(): v.decode("utf-8", "replace") for k, v in headers}
+    name = unquote(hdr.get("x-file-name", "")).strip()
+    ctype = (hdr.get("content-type") or "application/octet-stream").split(";")[0].strip()
+    chunks, total = [], 0
+    while True:
+        msg = await receive()
+        if msg["type"] != "http.request":
+            return
+        part = msg.get("body", b"")
+        total += len(part)
+        if total > STAGE_UPLOAD_MAX_BYTES:
+            await send_json(send, 413, b'{"success":false,"error":"file too large (25 MB max)"}')
+            return
+        chunks.append(part)
+        if not msg.get("more_body"):
+            break
+    try:
+        qs = parse_qs((scope.get("query_string") or b"").decode("utf-8", "replace"))
+        ttl = clamp_ttl((qs.get("ttl_seconds") or [None])[0])
+        if not total:
+            raise _VE("empty upload body")
+        staged = stage_bytes(b"".join(chunks), name, ctype, ttl)
+    except _VE as exc:
+        await send_json(send, 400, _json.dumps({"success": False, "error": str(exc)}).encode())
+        return
+    payload = {"success": True, **staged.to_dict()}
+    await send_json(send, 200, _json.dumps(payload).encode())
+
+
 def _authorized_request(
     headers: Iterable[Tuple[bytes, bytes]],
     api_key: Optional[str],
@@ -553,7 +627,9 @@ class EWSMCPServer:
             # Check rate limit
             if self.rate_limiter:
                 try:
-                    self.rate_limiter.check_and_raise()
+                    await self.rate_limiter.acquire(
+                        max_wait=float(os.environ.get("RATE_LIMIT_MAX_WAIT_SECONDS", "60"))
+                    )
                 except Exception as e:
                     return [TextContent(
                         type="text",
@@ -715,12 +791,13 @@ class EWSMCPServer:
         """Register all enabled tools (42 base tools, up to 46 with AI)."""
         tool_classes = []
 
-        # Email tools (10 core + 3 drafts = 13)
+        # Email tools (11 core + 4 drafts = 15)
         if self.settings.enable_email:
             tool_classes.extend([
                 CreateDraftTool,
                 CreateReplyDraftTool,
                 CreateForwardDraftTool,
+                UpdateDraftTool,
                 SendEmailTool,
                 ReadEmailsTool,
                 SearchEmailsTool,
@@ -733,9 +810,16 @@ class EWSMCPServer:
                 ReplyEmailTool,
                 ForwardEmailTool
             ])
-            self.logger.info("Email tools enabled (14 tools)")
+            self.logger.info("Email tools enabled (15 tools)")
 
-        # Attachment tools (7 tools)
+        # Mailbox inventory (1 tool). The mail-CRUD tools above already serve
+        # every configured mailbox — Exchange, iCloud/IMAP, Outlook/Graph —
+        # by routing on ``target_mailbox``.
+        if self.settings.enable_email:
+            tool_classes.append(ListMailboxesTool)
+            self.logger.info("Mailbox inventory tool enabled (1 tool)")
+
+        # Attachment tools (9: 7 + outbound staging for remote agents)
         if self.settings.enable_email:
             tool_classes.extend([
                 ListAttachmentsTool,
@@ -744,9 +828,11 @@ class EWSMCPServer:
                 DeleteAttachmentTool,
                 ReadAttachmentTool,
                 GetEmailMimeTool,
-                AttachEmailToDraftTool
+                AttachEmailToDraftTool,
+                StageOutgoingFileTool,
+                DeleteStagedFileTool,
             ])
-            self.logger.info("Attachment tools enabled (7 tools)")
+            self.logger.info("Attachment tools enabled (9 tools)")
 
         # Calendar tools (7 tools)
         if self.settings.enable_calendar:
@@ -845,6 +931,27 @@ class EWSMCPServer:
             ])
             self.logger.info("Agent-secretary tools enabled (v4: 21 tools, slimmed)")
 
+        # SmarterMail private-REST tools: capabilities EWS cannot express
+        # (scheduled send, signatures, notes, recurrence, virtual folders,
+        # file storage, domain administration). Every tool refuses an
+        # IMAP/Graph mailbox. Admin tools are registered only when
+        # SMARTERMAIL_ADMIN_TOOLS is on; execution is also gated.
+        if getattr(self.settings, "smartermail_enabled", False):
+            sm_tools = (
+                list(SM_MAIL_TOOLS)
+                + list(SM_SETTINGS_TOOLS)
+                + list(SM_CALENDAR_CONTACT_TOOLS)
+                + list(SM_WORKSPACE_TOOLS)
+            )
+            if getattr(self.settings, "smartermail_admin_tools", False):
+                sm_tools.extend(SM_ADMIN_TOOLS)
+            tool_classes.extend(sm_tools)
+            self.logger.info(
+                "SmarterMail REST tools enabled (%d tools; domain admin %s)",
+                len(sm_tools),
+                "on" if getattr(self.settings, "smartermail_admin_tools", False) else "off",
+            )
+
         # Instantiate and register tools
         for tool_class in tool_classes:
             tool = tool_class(self.ews_client)
@@ -873,9 +980,11 @@ class EWSMCPServer:
             self.logger.info(f"User: {self.settings.ews_email}")
             self.logger.info(f"Auth: {self.settings.ews_auth_type}")
 
-            # Test connection
+            # Test connection (lazy: skipped so startup never touches EWS;
+            # the connection opens on the first real tool call instead — keeps
+            # tools/list EWS-free and avoids SmarterMail's per-IP throttle).
             self.logger.info("Testing Exchange connection...")
-            if not self.ews_client.test_connection():
+            if False and not self.ews_client.test_connection():
                 self.logger.error("Failed to connect to Exchange server")
                 self.logger.error("Please check your configuration and credentials")
 
@@ -951,6 +1060,20 @@ class EWSMCPServer:
                         "or set MCP_API_KEY before exposing the port beyond localhost."
                     )
                 await self.run_sse()
+            elif self.settings.mcp_transport == "streamable-http":
+                self.logger.info(
+                    f"Server ready - streamable-http on "
+                    f"http://{self.settings.mcp_host}:{self.settings.mcp_port}/mcp"
+                )
+                if not self.settings.mcp_api_key:
+                    self.logger.warning(
+                        "Streamable-HTTP transport running without MCP_API_KEY: "
+                        "/mcp accepts unauthenticated requests. This is only "
+                        "allowed on a loopback bind or with "
+                        "MCP_ALLOW_UNAUTHENTICATED=true — keep the port on a "
+                        "private network or set MCP_API_KEY."
+                    )
+                await self.run_streamable_http()
 
         except KeyboardInterrupt:
             self.logger.info("Shutting down...")
@@ -1143,6 +1266,104 @@ class EWSMCPServer:
             )
         except Exception as exc:
             self.logger.warning(f"warmup: failed: {exc}")
+
+    async def run_streamable_http(self):
+        """Run the MCP server with the native Streamable HTTP transport.
+
+        Uses the SDK's StreamableHTTPSessionManager with stateful sessions, so
+        the whole server runs in-process — no supergateway stdio bridge and
+        therefore no per-request child-process spawn. A persistent MCP session
+        is reused across the client's keep-alive pings, which is what fixes the
+        orphaned-python-process memory leak the supergateway path suffered.
+        """
+        import uvicorn
+        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+        api_key = self.settings.mcp_api_key
+        # stateless=True: each request is handled by an ephemeral in-process
+        # session (no Mcp-Session-Id handshake required), which is drop-in for
+        # lenient MCP gateway clients. The EWS client + tool registry
+        # are server-level singletons, so this stays in-process with NO
+        # subprocess spawn — the orphaned-process leak cannot recur.
+        session_manager = StreamableHTTPSessionManager(
+            app=self.server,
+            json_response=True,
+            stateless=True,
+        )
+
+        async def _send_json(send, status, payload):
+            await send({
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    [b"content-type", b"application/json"],
+                    [b"content-length", str(len(payload)).encode()],
+                ],
+            })
+            await send({"type": "http.response.body", "body": payload})
+
+        async def asgi(scope, receive, send):
+            scope_type = scope["type"]
+            if scope_type == "lifespan":
+                while True:
+                    message = await receive()
+                    if message["type"] == "lifespan.startup":
+                        await send({"type": "lifespan.startup.complete"})
+                    elif message["type"] == "lifespan.shutdown":
+                        await send({"type": "lifespan.shutdown.complete"})
+                        return
+            if scope_type != "http":
+                return
+            path = scope.get("path", "")
+            # Health is unauthenticated; /mcp is served directly (no trailing-
+            # slash redirect) so it's a drop-in for the supergateway endpoint.
+            if path == "/health":
+                await _send_json(
+                    send, 200, b'{"status":"ok","tools":%d}' % len(self.tools)
+                )
+                return
+            if path == "/mcp" or path.startswith("/mcp/"):
+                if api_key and not _authorized_request(
+                    scope.get("headers") or [], api_key, scope.get("query_string")
+                ):
+                    await send({
+                        "type": "http.response.start",
+                        "status": 401,
+                        "headers": [
+                            [b"content-type", b"application/json"],
+                            [b"www-authenticate", b'Bearer realm="ews-mcp"'],
+                        ],
+                    })
+                    await send({
+                        "type": "http.response.body",
+                        "body": b'{"success":false,"error":"Unauthorized"}',
+                    })
+                    return
+                await session_manager.handle_request(scope, receive, send)
+                return
+            if path == "/stage":
+                await _handle_stage_upload(scope, receive, send, _send_json)
+                return
+            await _send_json(send, 404, b'{"success":false,"error":"Not Found"}')
+
+        http_keep_alive = int(
+            getattr(self.settings, "http_keep_alive_timeout_seconds", 300)
+        )
+        config = uvicorn.Config(
+            asgi,
+            host=self.settings.mcp_host,
+            port=self.settings.mcp_port,
+            log_level=self.settings.log_level.lower(),
+            http="h11",
+            timeout_keep_alive=http_keep_alive,
+            timeout_graceful_shutdown=30,
+        )
+        server = uvicorn.Server(config)
+        async with session_manager.run():
+            self.logger.info(
+                "Streamable HTTP session manager started (stateful sessions)"
+            )
+            await server.serve()
 
     async def run_sse(self):
         """Run the MCP server with SSE (HTTP) transport."""

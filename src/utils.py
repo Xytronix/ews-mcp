@@ -3,12 +3,23 @@
 from datetime import datetime
 from decimal import Decimal as _Decimal
 from typing import Any, Dict, List, Optional, Union
+import base64
+import binascii
 import html
+import mimetypes
 import logging
 import os
 import json
 import re
-from exchangelib import EWSTimeZone, EWSDateTime, EWSDate, FileAttachment
+from uuid import uuid4
+from exchangelib import (
+    EWSTimeZone,
+    EWSDateTime,
+    EWSDate,
+    ExtendedProperty,
+    FileAttachment,
+    Message,
+)
 import pytz
 
 # Cached reference to exchangelib's CalendarEventDetails (used by the
@@ -280,6 +291,34 @@ def truncate_text(text: str, max_length: int = 100) -> str:
     return text[:max_length - 3] + "..."
 
 
+#: Custom RFC 822 header carrying our correlation ID on every outbound
+#: message. ``Message.send()`` returns no server-side ID, so this header is
+#: the only way to find a sent message again in raw MIME or in the logs of
+#: whatever hop rejected it.
+OUTBOUND_TRACKING_HEADER = "X-EWS-MCP-Tracking-ID"
+
+
+def new_outbound_tracking_id() -> str:
+    """Create a correlation ID to carry in :data:`OUTBOUND_TRACKING_HEADER`."""
+    return f"ews-mcp-{uuid4().hex}"
+
+
+class OutboundTrackingId(ExtendedProperty):
+    """Carries :data:`OUTBOUND_TRACKING_HEADER` into the sent MIME message.
+
+    Registered as ``Message.outbound_tracking_id``. It lives here, next to the
+    header constant, so both the Exchange tools and the EWS mail backend can
+    stamp an outbound message without either importing the other.
+    """
+
+    distinguished_property_set_id = "InternetHeaders"
+    property_name = OUTBOUND_TRACKING_HEADER
+    property_type = "String"
+
+
+Message.register("outbound_tracking_id", OutboundTrackingId)
+
+
 def safe_get(obj: Any, attr: str, default: Any = None) -> Any:
     """Safely get attribute from object."""
     try:
@@ -438,6 +477,8 @@ def format_error_response(error: Exception, context: str = "") -> Dict[str, Any]
       for EWSConnectionError, etc.).
     * ``error_class``: fully-qualified class name (module.Class), useful
       for filing bugs against exchangelib or the MCP layer.
+    * ``hint`` (only when the exception carries one): remediation guidance,
+      never truncated.
     """
     logger = logging.getLogger(__name__)
     raw = str(error) or ""
@@ -454,12 +495,16 @@ def format_error_response(error: Exception, context: str = "") -> Dict[str, Any]
 
     logger.error(prefixed)
 
-    return {
+    response = {
         "success": False,
         "error": prefixed,
         "error_type": type_name,
         "error_class": f"{type(error).__module__}.{type_name}",
     }
+    hint = getattr(error, "hint", None)
+    if hint:
+        response["hint"] = str(hint)
+    return response
 
 
 def format_success_response(message: str, **kwargs) -> Dict[str, Any]:
@@ -737,6 +782,50 @@ def find_message_across_folders(ews_client, message_id):
     return find_message_for_account(ews_client.account, message_id)
 
 
+def decode_base64_payload(value: Any, field: str = "file_content") -> bytes:
+    """Strictly decode a base64 payload supplied by a caller.
+
+    ``base64.b64decode`` defaults to ``validate=False``, which *discards*
+    every character outside the base64 alphabet. A data-URL prefix
+    ("data:application/pdf;base64,JVBER...") or any stray header therefore
+    decodes to silently corrupted bytes and the attachment lands unreadable.
+    Strip the prefix and MIME line wrapping explicitly, repair padding, and
+    decode strictly so bad input fails loudly instead.
+    """
+    from .exceptions import ValidationError
+
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    text = str(value or "").strip()
+    if not text:
+        raise ValidationError(f"{field} is empty")
+    if text.startswith("data:"):
+        _, _, text = text.partition(",")
+    text = "".join(text.split())
+    text += "=" * (-len(text) % 4)
+    try:
+        return base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ValidationError(
+            f"{field} is not valid base64 ({exc}); send raw base64 without a "
+            "'data:<type>;base64,' prefix"
+        ) from exc
+
+
+def guess_content_type(file_name: Optional[str], explicit: Optional[str] = None) -> str:
+    """MIME type for an attachment: caller's value, else guessed from the name.
+
+    exchangelib only guesses when ``content_type`` is ``None``, so passing a
+    hardcoded ``application/octet-stream`` default makes every PDF and image
+    an opaque blob that clients render as a generic download.
+    """
+    if explicit:
+        return str(explicit)
+
+    guessed, _ = mimetypes.guess_type(file_name or "")
+    return guessed or "application/octet-stream"
+
+
 def _safe_content_id(file_name: str, index: int, existing: set) -> str:
     """Produce a safe, unique cid: value from an arbitrary file name.
 
@@ -770,8 +859,6 @@ def attach_inline_files(message, inline_attachments: list) -> int:
     if not inline_attachments:
         return 0
 
-    import base64
-
     count = 0
     used_cids: set = set()
     for index, att in enumerate(inline_attachments):
@@ -790,8 +877,8 @@ def attach_inline_files(message, inline_attachments: list) -> int:
 
         file_attachment = FileAttachment(
             name=file_name,
-            content=base64.b64decode(file_content),
-            content_type=att.get("content_type", "application/octet-stream"),
+            content=decode_base64_payload(file_content, f"inline_attachments[{index}].file_content"),
+            content_type=guess_content_type(file_name, att.get("content_type")),
             is_inline=is_inline,
             content_id=content_id,
         )
@@ -804,7 +891,7 @@ def attach_inline_files(message, inline_attachments: list) -> int:
 # Shared schema for inline_attachments parameter (base64-encoded files)
 INLINE_ATTACHMENTS_SCHEMA = {
     "inline_attachments": {
-        "description": "Attachments as base64-encoded content. Use when file paths are not accessible (e.g. in cloud/Docker environments).",
+        "description": "Exchange-only base64 attachment objects. Use files with file_content on Graph/IMAP.",
         "type": "array",
         "items": {
             "type": "object",
@@ -832,3 +919,71 @@ INLINE_ATTACHMENTS_SCHEMA = {
         }
     }
 }
+
+
+def iso_or_none(value: Any) -> Optional[str]:
+    """``value.isoformat()`` when it is a datetime-like, else ``None``."""
+    if value is None or not hasattr(value, "isoformat"):
+        return None
+    try:
+        return value.isoformat()
+    except Exception:
+        return None
+
+
+def item_text_body(item: Any) -> str:
+    """Plain-text body of an EWS item, never empty when content exists.
+
+    Falls back from ``text_body`` to the HTML ``body`` and finally to the
+    item's MIME content (only if already loaded) — some EWS servers return
+    ``TextBody`` as None for HTML-only messages.
+    """
+    from .body_format import html_to_text
+    text = safe_get(item, "text_body", None) or ""
+    if text.strip():
+        return text
+    body = safe_get(item, "body", None)
+    html = str(body) if body else ""
+    if html.strip():
+        return html_to_text(html) if "<" in html else html
+    return mime_text_body(safe_get(item, "mime_content", None))
+
+
+def mime_text_body(mime: Any) -> str:
+    """Extract a text body from raw MIME bytes (text/plain, else html->text)."""
+    if not mime:
+        return ""
+    import email
+    from email import policy
+    from .body_format import html_to_text
+    try:
+        raw = mime.encode("utf-8") if isinstance(mime, str) else bytes(mime)
+        msg = email.message_from_bytes(raw, policy=policy.default)
+        part = msg.get_body(preferencelist=("plain",))
+        if part is not None:
+            content = part.get_content()
+            if content and content.strip():
+                return content
+        part = msg.get_body(preferencelist=("html",))
+        if part is not None:
+            return html_to_text(part.get_content())
+    except Exception:
+        return ""
+    return ""
+
+
+def sender_matches(item: Any, needle: Optional[str]) -> bool:
+    """Case-insensitive substring match of ``needle`` against the sender."""
+    needle = (needle or "").strip().casefold()
+    if not needle:
+        return True
+    sender = safe_get(item, "sender", None) or safe_get(item, "author", None)
+    addr = str(safe_get(sender, "email_address", "") or "").casefold()
+    name = str(safe_get(sender, "name", "") or "").casefold()
+    return needle in addr or needle in name
+
+
+def is_full_address(value: Optional[str]) -> bool:
+    """True for ``local@domain`` (EWS exact sender restriction usable)."""
+    v = (value or "").strip()
+    return bool(re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", v))

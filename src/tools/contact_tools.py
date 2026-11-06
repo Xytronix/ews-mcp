@@ -10,6 +10,31 @@ from ..exceptions import ToolExecutionError
 from ..utils import format_success_response, safe_get, ews_id_to_str
 
 
+# Same trap as tasks: ``account.contacts.get(id=...)`` requests every Contact
+# field including ``mime_content``, and SmarterMail answers
+# ErrorUnsupportedMimeConversion ("MIME content not supported for this item
+# type"), which broke update_contact / delete_contact outright. EWS cannot
+# filter on ``id``, so fetch by (id, changekey) with an explicit field list.
+CONTACT_FETCH_FIELDS = (
+    "display_name", "given_name", "surname", "email_addresses",
+    "phone_numbers", "company_name", "job_title", "categories",
+    "physical_addresses", "department", "office",
+)
+
+
+def get_contact_by_id(account, item_id):
+    """Fetch one contact by id without requesting its MIME content."""
+    results = list(
+        account.fetch(ids=[(item_id, None)], only_fields=CONTACT_FETCH_FIELDS)
+    )
+    if not results:
+        raise ToolExecutionError(f"Contact not found: {item_id}")
+    contact = results[0]
+    if isinstance(contact, Exception):
+        raise ToolExecutionError(f"Contact not found: {item_id}: {contact}")
+    return contact
+
+
 class CreateContactTool(BaseTool):
     """Tool for creating contacts."""
 
@@ -228,35 +253,59 @@ class UpdateContactTool(BaseTool):
             mailbox = self.get_mailbox_info(target_mailbox)
 
             # Get the contact
-            contact = account.contacts.get(id=item_id)
+            contact = get_contact_by_id(account, item_id)
 
-            # Update fields
+            # Track the touched fields: a bare save() updates every writable
+            # Contact field on the server.
+            changed_fields = []
+
             if "given_name" in kwargs:
                 contact.given_name = kwargs["given_name"]
+                changed_fields.append("given_name")
 
             if "surname" in kwargs:
                 contact.surname = kwargs["surname"]
+                changed_fields.append("surname")
 
+            # Multi-valued fields are replaced wholesale by EWS, so keep the
+            # other labels (EmailAddress2/3, MobilePhone, HomePhone, ...)
+            # instead of wiping them when only one entry is supplied.
             if "email_address" in kwargs:
-                contact.email_addresses = [
+                others = [
+                    e for e in (contact.email_addresses or [])
+                    if getattr(e, "label", None) != 'EmailAddress1'
+                ]
+                contact.email_addresses = others + [
                     EmailAddress(email=kwargs["email_address"], label='EmailAddress1')
                 ]
+                changed_fields.append("email_addresses")
 
             if "phone_number" in kwargs:
-                contact.phone_numbers = [PhoneNumber(label='BusinessPhone', phone_number=kwargs["phone_number"])]
+                others = [
+                    p for p in (contact.phone_numbers or [])
+                    if getattr(p, "label", None) != 'BusinessPhone'
+                ]
+                contact.phone_numbers = others + [
+                    PhoneNumber(label='BusinessPhone', phone_number=kwargs["phone_number"])
+                ]
+                changed_fields.append("phone_numbers")
 
             if "company" in kwargs:
                 contact.company_name = kwargs["company"]
+                changed_fields.append("company_name")
 
             if "job_title" in kwargs:
                 contact.job_title = kwargs["job_title"]
+                changed_fields.append("job_title")
 
             # Issue #114
             if "categories" in kwargs:
                 contact.categories = list(kwargs["categories"] or [])
+                changed_fields.append("categories")
 
             # Save changes
-            contact.save()
+            if changed_fields:
+                contact.save(update_fields=changed_fields)
 
             self.logger.info(f"Updated contact {item_id}")
 
@@ -305,7 +354,7 @@ class DeleteContactTool(BaseTool):
             mailbox = self.get_mailbox_info(target_mailbox)
 
             # Get and delete the contact
-            contact = account.contacts.get(id=item_id)
+            contact = get_contact_by_id(account, item_id)
             contact.delete()
 
             self.logger.info(f"Deleted contact {item_id}")

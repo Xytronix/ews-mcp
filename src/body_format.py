@@ -50,8 +50,8 @@ except Exception:  # pragma: no cover
 
 
 VALID_FORMATS = ("html", "markdown", "text")
-DEFAULT_READ_FORMAT = "html"     # zero behaviour change for v3.4 callers
-DEFAULT_WRITE_FORMAT = "html"    # zero behaviour change for v3.4 callers
+DEFAULT_READ_FORMAT = "markdown"  # ~12x cheaper than Outlook HTML; html is opt-in
+DEFAULT_WRITE_FORMAT = "html"    # zero behaviour change for v3.4 writers
 
 
 # Tags markdownify should strip wholesale. The Outlook MSO/Word HTML graveyard
@@ -69,6 +69,92 @@ _MSO_STRIP = [
 # ============================================================================
 # READ DIRECTION  (HTML -> markdown / text)
 # ============================================================================
+
+def _strip_non_content(html: str) -> str:
+    """Drop <head>/<style>/<script>/<title>, comments and CDATA before
+    conversion. markdownify's ``strip`` keeps the *text* of stripped tags,
+    so CSS (e.g. ``#outlook a {...}``) otherwise leaks into the body."""
+    if not html:
+        return ""
+    out = re.sub(r"(?s)<!--.*?-->", " ", html)
+    out = out.replace("<![CDATA[", "").replace("]]>", "")
+    out = re.sub(r"(?is)<(head|style|script|title|xml)\b[^>]*>.*?</\1\s*>", " ", out)
+    out = re.sub(r"(?is)<(style|script)\b[^>]*/>", " ", out)
+    return out
+
+
+def _is_layout_table(table) -> bool:
+    role = (table.get("role") or "").lower()
+    if role in ("presentation", "none"):
+        return True
+    own_rows = [tr for tr in table.find_all("tr") if tr.find_parent("table") is table]
+    if any(tr.find("th", recursive=False) for tr in own_rows):
+        return False
+    if len(own_rows) <= 1:
+        return True
+    if any(len(tr.find_all(["td", "th"], recursive=False)) <= 1 for tr in own_rows):
+        return True
+    # Nested tables mean layout scaffolding, not tabular data.
+    return table.find("table") is not None or not table.find("th")
+
+
+def _flatten_layout_tables(html: str) -> str:
+    """Unwrap email layout tables (no header cells / role=presentation /
+    single-cell rows) into block elements so markdown isn't empty |  | grids."""
+    if not html or "<table" not in html.lower():
+        return html
+    try:
+        from bs4 import BeautifulSoup
+    except Exception:
+        return html
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for table in reversed(soup.find_all("table")):  # innermost first
+            if not _is_layout_table(table):
+                continue
+            for cell in table.find_all(["td", "th"]):
+                if cell.find_parent("table") is table:
+                    cell.name = "div"
+                    cell.attrs = {}
+            for tag in table.find_all(["tr", "tbody", "thead", "tfoot"]):
+                if tag.find_parent("table") is table:
+                    tag.name = "div"
+                    tag.attrs = {}
+            table.name = "div"
+            table.attrs = {}
+        return str(soup)
+    except Exception as exc:
+        _log.debug("layout-table flatten failed: %s", exc)
+        return html
+
+
+_EMPTY_TABLE_LINE = re.compile(r"^[\s|:\-]*$")
+
+
+def _drop_empty_table_lines(md: str) -> str:
+    lines = [ln for ln in md.splitlines()
+             if not ("|" in ln and _EMPTY_TABLE_LINE.match(ln))]
+    out = "\n".join(ln.rstrip() for ln in lines)
+    return re.sub(r"\n{3,}", "\n\n", out).strip()
+
+
+def html_to_text(html: str) -> str:
+    """Best-effort HTML -> plain text for servers that omit EWS TextBody."""
+    if not html:
+        return ""
+    import html as _html_mod
+    txt = re.sub(r"(?is)<(script|style|head|title)[^>]*>.*?</\1>", " ", html)
+    txt = txt.replace("<![CDATA[", "").replace("]]>", "")
+    # keep link targets visible (magic links, verification URLs)
+    txt = re.sub(r'(?is)<a\b[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+                 lambda m: f"{m.group(2)} ({m.group(1)})", txt)
+    txt = re.sub(r"(?i)<br\s*/?>|</(p|div|tr|li|h[1-6]|table)>", "\n", txt)
+    txt = re.sub(r"(?s)<[^>]+>", " ", txt)
+    txt = _html_mod.unescape(txt).replace("\xa0", " ")
+    txt = re.sub(r"[ \t\r\f\v]+", " ", txt)
+    txt = re.sub(r" *\n *", "\n", txt)
+    return re.sub(r"\n{3,}", "\n\n", txt).strip()
+
 
 def render_body(
     html: str,
@@ -89,6 +175,10 @@ def render_body(
 
     html = html or ""
     plain = plain or ""
+    if not plain.strip() and html:
+        # Some EWS servers (e.g. SmarterMail) never populate
+        # TextBody for HTML-only mail; derive text so callers never get "".
+        plain = html_to_text(html)
 
     if fmt == "html":
         return html, "html"
@@ -104,7 +194,9 @@ def render_body(
         # caller sees the real shape rather than a confusing 'markdown=""'.
         return plain, "text"
     try:
-        md = _md(html, strip=_MSO_STRIP, heading_style="ATX")
+        md = _md(_flatten_layout_tables(_strip_non_content(html)),
+                 strip=_MSO_STRIP, heading_style="ATX")
+        md = _drop_empty_table_lines(md)
         # markdownify is greedy on whitespace; collapse 3+ blank lines into 2
         md = re.sub(r"\n{3,}", "\n\n", md).strip()
         return md, "markdown"
@@ -210,11 +302,11 @@ READ_FORMAT_SCHEMA = {
         "enum": list(VALID_FORMATS),
         "default": DEFAULT_READ_FORMAT,
         "description": (
-            "Body representation in the response. 'html' (default) returns "
-            "the raw Outlook HTML — backward compatible with v3.4. 'markdown' "
+            "Body representation in the response. 'markdown' (default) "
             "converts the HTML to GFM markdown server-side (~12x fewer tokens "
-            "on Outlook MSO bodies; result is cached). 'text' returns plain "
-            "text only (lossy — drops links and inline images)."
+            "on Outlook MSO bodies; result is cached). 'html' is the escape "
+            "hatch for the raw Outlook HTML. 'text' returns plain text only "
+            "(lossy — drops links and inline images)."
         ),
     },
     "trim_quoted": {

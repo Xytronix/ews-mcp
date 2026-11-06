@@ -1,7 +1,8 @@
-> **Legacy 4.0 documentation** — this page describes the `src/` server
-> that ships as `ghcr.io/azizmazrou/ews-mcp:latest`. For the current
-> 4.5 line see [`v5/README.md`](../../v5/README.md) and
-> [`v5/docs/API.md`](../../v5/docs/API.md).
+> **Legacy 4.0 documentation.** This page describes the `src/` server as
+> extended by this fork. Upstream's `ghcr.io/azizmazrou/ews-mcp:latest` image
+> does not include the fork's additions, and the fork publishes no image (see
+> the [README](../../README.md#quick-start)). For upstream's 4.5 line see
+> [`v5/README.md`](../../v5/README.md) and [`v5/docs/API.md`](../../v5/docs/API.md).
 
 # Reply & Forward Email Tools
 
@@ -9,11 +10,24 @@ This document describes the `reply_email` and `forward_email` tools for the EWS 
 
 ## Overview
 
-These tools enable AI assistants to reply to and forward emails while preserving:
-- Full email body content (including conversation threads)
-- Inline images (signatures with logos, embedded images)
-- Proper header formatting (Outlook-style)
-- Conversation threading metadata
+Both tools route by `target_mailbox` to configured Exchange, Graph or
+IMAP/SMTP accounts. Use `list_mailboxes` to discover accounts. For IMAP,
+also pass the source `folder` when the message is outside Inbox; use a
+standard alias or the native folder `id`/`path` returned by `list_folders`.
+
+The Exchange implementation quotes original content, preserves inline
+images and formats Outlook-style headers. Graph uses native reply/forward
+actions. IMAP replies include the supplied body and new files, not automatic
+quotation of the original body or its inline images; IMAP forwards retain
+the original content and attachments.
+
+Use canonical `files` for one-call attachments across providers. Prefer
+`file_path` when the server can read the file; remote agents without shared
+storage use `file_url` or base64 `file_content`. Legacy Exchange
+`attachments`/`inline_attachments` remain supported but deprecated.
+For review before sending, use `create_reply_draft` or `create_forward_draft`
+on any provider, then `update_draft` and `send_email(draft_id=…)`.
+See [drafts and recovery](API.md#drafts) for fresh IDs, limits and error handling.
 
 ---
 
@@ -21,24 +35,36 @@ These tools enable AI assistants to reply to and forward emails while preserving
 
 ### Description
 
-Reply to an existing email while preserving the conversation thread. Uses Exchange's built-in reply mechanism to maintain In-Reply-To headers, conversation ID, and thread relationship.
+On Exchange, replies are composed locally with quoted content and available
+`In-Reply-To`/`References` headers, not Exchange's native reply action.
+Graph uses native reply actions; IMAP composes a new MIME reply with
+threading headers. Client conversation grouping is not guaranteed.
 
 ### Parameters
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `message_id` | string | Yes | The Exchange message ID of the email to reply to |
-| `body` | string | Yes | The reply body (HTML supported) |
+| `message_id` | string | Yes | Message ID in the selected mailbox; IMAP also needs the correct `folder` |
+| `body` | string | Yes | Reply content; interpreted according to `body_format` |
 | `reply_all` | boolean | No | If true, reply to all recipients; if false, reply only to sender (default: false) |
-| `attachments` | array | No | File paths to attach to the reply |
-| `target_mailbox` | string | No | Email address to reply from (requires impersonation/delegate access) |
+| `files` | array | No | Canonical attachment sources; see [API](API.md#attachment-sources) |
+| `attachments` | array | No | **Deprecated, Exchange-only** server-local file paths; use `files` |
+| `inline_attachments` | array | No | **Deprecated, Exchange-only** base64 file objects; use `files` |
+| `body_format` | string | No | `html` (default), `markdown` or `text` |
+| `folder` | string | No | IMAP source folder (default `inbox`) |
+| `cleanup_on_failure` | boolean | No | Graph multi-step sends: default false retains a newly created draft for recovery; see [recovery](API.md#draft-recovery) |
+| `target_mailbox` | string | No | Configured account to reply from; Exchange impersonation/delegate access where applicable |
 
 ### Response
+
+Exchange example (provider-specific metadata varies). Acceptance is not
+confirmation of recipient delivery:
 
 ```json
 {
   "status": "success",
-  "message": "Reply sent successfully",
+  "accepted_by_mail_server": true,
+  "delivery_confirmed": false,
   "original_subject": "Original Email Subject",
   "reply_to": ["sender@example.com"],
   "reply_all": false,
@@ -64,14 +90,14 @@ reply_email(
     reply_all=True
 )
 
-# Reply with attachment
+# Reply with a file accessible to the server
 reply_email(
     message_id="AAMkADc3MWUy...",
     body="Please find the updated document attached.",
-    attachments=["/path/to/document.pdf"]
+    files=[{"file_path": "/path/to/document.pdf"}]
 )
 
-# Reply on behalf of another user (impersonation)
+# Exchange reply on behalf of another user (impersonation)
 reply_email(
     message_id="AAMkADc3MWUy...",
     body="Thank you for contacting our team.",
@@ -91,20 +117,28 @@ Forward an existing email to new recipients while preserving the original conten
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `message_id` | string | Yes | The Exchange message ID of the email to forward |
+| `message_id` | string | Yes | Message ID in the selected mailbox; IMAP also needs the correct `folder` |
 | `to` | array | Yes | List of recipient email addresses |
 | `body` | string | No | Optional message to add before the forwarded content |
 | `cc` | array | No | CC recipients |
 | `bcc` | array | No | BCC recipients |
-| `attachments` | array | No | Additional file paths to attach |
-| `target_mailbox` | string | No | Email address to forward from (requires impersonation/delegate access) |
+| `files` | array | No | Canonical additional attachment sources; see [API](API.md#attachment-sources) |
+| `attachments` | array | No | **Deprecated, Exchange-only** server-local file paths; use `files` |
+| `inline_attachments` | array | No | **Deprecated, Exchange-only** base64 file objects; use `files` |
+| `body_format` | string | No | `html` (default), `markdown` or `text` |
+| `folder` | string | No | IMAP source folder (default `inbox`) |
+| `cleanup_on_failure` | boolean | No | Graph multi-step sends: default false retains a newly created draft for recovery; see [recovery](API.md#draft-recovery) |
+| `target_mailbox` | string | No | Configured account to forward from; Exchange impersonation/delegate access where applicable |
 
 ### Response
+
+Exchange example (provider-specific metadata varies):
 
 ```json
 {
   "status": "success",
-  "message": "Email forwarded successfully",
+  "accepted_by_mail_server": true,
+  "delivery_confirmed": false,
   "original_subject": "Original Email Subject",
   "forwarded_to": ["recipient@example.com"],
   "cc": null,
@@ -140,15 +174,15 @@ forward_email(
     body="<p>Please review the attached proposal.</p>"
 )
 
-# Forward with additional attachment
+# Forward with an additional file accessible to the server
 forward_email(
     message_id="AAMkADc3MWUy...",
     to=["client@external.com"],
     body="Here's the information you requested, along with our latest brochure.",
-    attachments=["/path/to/brochure.pdf"]
+    files=[{"file_path": "/path/to/brochure.pdf"}]
 )
 
-# Forward on behalf of another user (impersonation)
+# Exchange forward on behalf of another user (impersonation)
 forward_email(
     message_id="AAMkADc3MWUy...",
     to=["recipient@company.com"],
@@ -160,7 +194,8 @@ forward_email(
 
 ## Header Formatting
 
-Both tools format headers in Outlook-style:
+The Exchange implementations format quoted headers in Outlook-style.
+The following are illustrative layouts, not exact output templates:
 
 ### HTML Format
 
@@ -194,7 +229,8 @@ Subject: Project Update
 
 ## Inline Image Preservation
 
-Email signatures and embedded images are preserved correctly:
+On Exchange, original signature images and embedded images are copied into
+replies/forwards with their CID metadata. This is not an IMAP reply guarantee.
 
 ### How It Works
 
@@ -203,7 +239,7 @@ Email signatures and embedded images are preserved correctly:
    <img src="cid:image001.png@01DC676B.768520B0">
    ```
 
-2. When forwarding/replying, the tools copy attachments with:
+2. When forwarding/replying on Exchange, the tools copy attachments with:
    - `content_id` - The unique identifier for cid: references
    - `is_inline` - Flag marking the attachment as embedded
 
@@ -221,34 +257,39 @@ Email signatures and embedded images are preserved correctly:
 
 ## Conversation Threading
 
-Both tools preserve conversation metadata:
-
-| Metadata | Description |
-|----------|-------------|
-| `In-Reply-To` | References the original message ID |
-| `References` | Chain of message IDs in the conversation |
-| `Conversation-ID` | Exchange's conversation tracking ID |
-| `Thread-Index` | Thread position indicator |
-
-This ensures emails appear correctly grouped in:
-- Outlook conversation view
-- Gmail threading
-- Apple Mail threads
-- Most email clients
+Exchange replies and IMAP replies use available `In-Reply-To` and `References`
+headers to associate the reply with the original message. Graph uses the
+provider's native reply/forward actions. This does not promise unchanged
+Exchange conversation IDs or `Thread-Index` values across providers.
+Final grouping in Outlook, Gmail, Apple Mail or other clients is client-dependent.
 
 ---
 
 ## RTL (Right-to-Left) Support
 
-Full support for Arabic, Hebrew, and other RTL languages:
-
-- Original RTL formatting is preserved
-- Headers maintain proper direction
-- Unicode characters display correctly
+The Exchange quoted-body formatting handles Arabic, Hebrew and other RTL
+content. Unicode content is supported; the final rendering depends on the
+recipient's mail client. IMAP replies do not automatically quote the original.
 
 ---
 
 ## Error Handling
+
+Graph draft/upload/send failures expose recovery details rather than silently
+losing the draft ID. Retain the returned `draft_id`, `mailbox`, `folder` and
+`stage`; inspect submission uncertainty before retrying. Default behavior keeps
+the draft. Optional `cleanup_on_failure=true` only concerns a draft created by
+the current call, never an existing caller-supplied draft.
+The draft-creation variants also honor this option on IMAP when post-creation
+metadata/relisting fails and the new ID is known. Unknown IDs require
+re-listing Drafts, not guessing a deletion target. Graph skips cleanup if send
+acceptance is uncertain, even when cleanup was requested.
+
+IMAP responses distinguish `accepted_recipients` from `refused_recipients`.
+Partial SMTP acceptance is not delivery and must not trigger a resend to the
+accepted recipients. A timeout can leave submission uncertain. Check the
+mailbox and server evidence before retrying; neither SMTP nor these tools
+guarantee exactly-once delivery.
 
 ### Common Errors
 
@@ -276,11 +317,12 @@ reply_email(
 
 ### 2. Check Message ID Before Reply/Forward
 ```python
-# First get the message details
-details = get_email_details(message_id="...")
+# Keep the original ID rather than indexing a provider-specific response.
+original_id = "..."
+details = get_email_details(message_id=original_id)
 
-# Then reply
-reply_email(message_id=details["message_id"], body="...")
+# For IMAP outside Inbox, pass the same source folder to both calls.
+reply_email(message_id=original_id, body="...")
 ```
 
 ### 3. Use Reply All Carefully
@@ -323,7 +365,7 @@ def extract_body_html(message):
 
 ### Attachment Copying
 
-Attachments are copied with all properties preserved:
+The Exchange implementation copies file attachments with CID metadata:
 
 ```python
 new_attachment = FileAttachment(

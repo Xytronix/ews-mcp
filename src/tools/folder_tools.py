@@ -654,7 +654,10 @@ class ManageFolderTool(BaseTool):
 
             old_name = safe_get(folder, 'name', 'Unknown')
             folder.name = new_name
-            folder.save()
+            # Scope the UpdateFolder to the name. A bare save() sends every
+            # writable folder field, and SmarterMail rejects the whole request
+            # with "FolderClass cannot be modified".
+            folder.save(update_fields=["name"])
 
             return format_success_response(
                 f"Folder renamed from '{old_name}' to '{new_name}'",
@@ -729,8 +732,10 @@ class ManageFolderTool(BaseTool):
                     f"{destination_id or destination!r}"
                 )
 
-            folder.parent = target_parent
-            folder.save()
+            # EWS cannot reparent a folder through UpdateFolder — that is what
+            # a bare `folder.parent = x; folder.save()` compiles to, and it
+            # errors out. MoveFolder is the operation that actually moves it.
+            folder.move(to_folder=target_parent)
 
             return format_success_response(
                 f"Folder '{folder_name}' moved",

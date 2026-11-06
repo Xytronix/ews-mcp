@@ -4,11 +4,12 @@ import logging
 from typing import Any, Dict, Optional
 from datetime import datetime, timedelta
 from exchangelib import CalendarItem, Mailbox, Attendee, EWSTimeZone
+from exchangelib.items import SEND_TO_ALL_AND_SAVE_COPY, SEND_TO_NONE
 
 from .base import BaseTool
 from ..models import CreateAppointmentRequest, MeetingResponse
 from ..exceptions import ToolExecutionError, ValidationError
-from ..utils import format_success_response, safe_get, parse_datetime_tz_aware, make_tz_aware, format_datetime, ews_id_to_str, attach_inline_files, INLINE_ATTACHMENTS_SCHEMA, get_timezone as get_configured_timezone
+from ..utils import format_success_response, safe_get, parse_datetime_tz_aware, make_tz_aware, format_datetime, ews_id_to_str, attach_inline_files, find_message_for_account, INLINE_ATTACHMENTS_SCHEMA, get_timezone as get_configured_timezone
 
 
 def build_free_busy_accounts(email_addresses):
@@ -231,8 +232,15 @@ class CreateAppointmentTool(BaseTool):
             if inline_count > 0:
                 self.logger.info(f"Added {inline_count} inline (base64) attachment(s) to appointment")
 
-            # Save the appointment
-            item.save()
+            # An item with attendees is a meeting: exchangelib's save() default
+            # is SEND_TO_NONE, which stores the attendee list and invites
+            # nobody. Send the request (and keep a copy in Sent, matching the
+            # cancellation that delete_appointment already files there).
+            item.save(
+                send_meeting_invitations=(
+                    SEND_TO_ALL_AND_SAVE_COPY if request.attendees else SEND_TO_NONE
+                )
+            )
 
             self.logger.info(f"Created appointment: {request.subject}")
 
@@ -439,33 +447,54 @@ class UpdateAppointmentTool(BaseTool):
             # Get the appointment
             item = account.calendar.get(id=item_id)
 
-            # Update fields
+            # Track the fields actually touched: a bare save() makes
+            # exchangelib update every writable CalendarItem field, which
+            # fails on recurring occurrences (read-only uid/recurrence) and
+            # pushes unset values back to the server.
+            changed_fields = []
+
             if "subject" in kwargs:
                 item.subject = kwargs["subject"]
+                changed_fields.append("subject")
 
             if "start_time" in kwargs:
                 item.start = parse_datetime_tz_aware(kwargs["start_time"])
+                changed_fields.append("start")
 
             if "end_time" in kwargs:
                 item.end = parse_datetime_tz_aware(kwargs["end_time"])
+                changed_fields.append("end")
 
             if "location" in kwargs:
                 item.location = kwargs["location"]
+                changed_fields.append("location")
 
             if "body" in kwargs:
                 item.body = kwargs["body"]
+                changed_fields.append("body")
 
             # Issue #114 — replace categories with the supplied list.
             if "categories" in kwargs:
                 item.categories = list(kwargs["categories"] or [])
+                changed_fields.append("categories")
 
             # Add inline (base64) attachments if provided
             inline_count = attach_inline_files(item, kwargs.get("inline_attachments", []))
             if inline_count > 0:
                 self.logger.info(f"Added {inline_count} inline (base64) attachment(s) to appointment")
 
-            # Save changes
-            item.save()
+            # Same default trap as create: without send_meeting_invitations,
+            # attendees never see the new time/location.
+            has_attendees = bool(
+                (safe_get(item, "required_attendees", []) or [])
+                or (safe_get(item, "optional_attendees", []) or [])
+            )
+            item.save(
+                update_fields=changed_fields or None,
+                send_meeting_invitations=(
+                    SEND_TO_ALL_AND_SAVE_COPY if has_attendees else SEND_TO_NONE
+                ),
+            )
 
             self.logger.info(f"Updated appointment {item_id}")
 
@@ -521,9 +550,12 @@ class DeleteAppointmentTool(BaseTool):
             # Get and delete the appointment
             item = account.calendar.get(id=item_id)
 
-            # Check if we should send cancellation
-            required_attendees = safe_get(item, "required_attendees", []) or []
-            has_attendees = len(required_attendees) > 0
+            # Cancel when anyone was invited — optional attendees are
+            # attendees too, and only cancel() notifies them.
+            has_attendees = bool(
+                (safe_get(item, "required_attendees", []) or [])
+                or (safe_get(item, "optional_attendees", []) or [])
+            )
 
             if send_cancellation and has_attendees:
                 item.cancel()
@@ -586,8 +618,21 @@ class RespondToMeetingTool(BaseTool):
             account = self.get_account(target_mailbox)
             mailbox = self.get_mailbox_info(target_mailbox)
 
-            # Get the meeting request
-            item = account.calendar.get(id=item_id)
+            # An invitation that is still in the Inbox is a MeetingRequest,
+            # not a CalendarItem: account.calendar.get() asks EWS for
+            # CalendarItem-only properties and fails with
+            # ErrorInvalidPropertyRequest. Try the calendar first (the id a
+            # caller took from get_calendar), then fall back to the mail
+            # folders, where MeetingRequest exposes the same
+            # accept/decline API.
+            try:
+                item = account.calendar.get(id=item_id)
+            except Exception as calendar_exc:
+                self.logger.info(
+                    f"{item_id} is not a calendar item ({calendar_exc}); "
+                    "looking for a meeting request in the mail folders"
+                )
+                item = find_message_for_account(account, item_id)
 
             # Send response
             if response == "Accept":
@@ -823,7 +868,7 @@ class CheckAvailabilityTool(BaseTool):
 
 
 class FindMeetingTimesTool(BaseTool):
-    """Tool for finding optimal meeting times using AI-powered scheduling."""
+    """Tool for finding meeting times using deterministic availability scoring."""
 
     def get_schema(self) -> Dict[str, Any]:
         return {

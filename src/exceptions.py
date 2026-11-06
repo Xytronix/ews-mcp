@@ -1,9 +1,19 @@
 """Custom exceptions for EWS MCP Server."""
 
+from typing import Optional
+
 
 class EWSMCPException(Exception):
-    """Base exception for EWS MCP Server."""
-    pass
+    """Base exception for EWS MCP Server.
+
+    ``hint`` carries remediation guidance. Error messages are capped at 200
+    characters in tool responses, so the hint is returned beside the message
+    (``format_error_response``) instead of being truncated with it.
+    """
+
+    def __init__(self, *args, hint: Optional[str] = None):
+        super().__init__(*args)
+        self.hint = hint
 
 
 class AuthenticationError(EWSMCPException):

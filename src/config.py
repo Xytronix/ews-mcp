@@ -68,9 +68,42 @@ class Settings(BaseSettings):
     ews_username: Optional[str] = None
     ews_password: Optional[str] = None
 
+    # Multi-account (Option B): extra mailboxes, each with its OWN credentials,
+    # selected per tool call via `target_mailbox`. SmarterMail has no EWS
+    # impersonation, so every mailbox authenticates with its own password.
+    # Loaded EXCLUSIVELY from the Supabase `ews_accounts` table at startup (see
+    # load_supabase_accounts). The validation_alias points at an env name that is
+    # never set, so a stray EWS_ACCOUNTS in the environment is ignored — the
+    # table is the single source of truth.
+    ews_accounts: dict[str, str] = Field(
+        default_factory=dict,
+        validation_alias="ews_accounts_table_only",
+        description="Mailboxes {email: password} loaded from the Supabase ews_accounts table",
+    )
+
+    # Supabase store for the same multi-account mailboxes, so operators can
+    # manage many mailboxes in a Supabase table (edited in Studio's Table
+    # Editor) instead of one large EWS_ACCOUNTS env blob. Read once at startup
+    # over the Supabase REST API (no Postgres driver needed). Rows merge into
+    # ews_accounts (Supabase wins over env on a duplicate email). Use the
+    # service-role key and keep the table behind RLS.
+    supabase_url: Optional[str] = None
+    supabase_service_key: Optional[str] = None
+    ews_accounts_table: str = "ews_accounts"
+
+    # Full Supabase rows (email/password plus the optional provider/settings
+    # columns) for the provider-agnostic mailbox registry in
+    # src/mail_backends. ews_accounts above stays EWS-only so the Exchange
+    # tools never try to open an iCloud/Outlook mailbox over EWS.
+    mail_account_rows: list[dict] = Field(
+        default_factory=list,
+        validation_alias="mail_account_rows_table_only",
+        description="Raw mailbox rows from the Supabase accounts table",
+    )
+
     # Server configuration
     mcp_server_name: str = "ews-mcp-server"
-    mcp_transport: Literal["stdio", "sse"] = "stdio"
+    mcp_transport: Literal["stdio", "sse", "streamable-http"] = "stdio"
     # Default to localhost. The SSE transport serves an unauthenticated-by-default
     # REST surface; operators must opt in to 0.0.0.0 and should set MCP_API_KEY
     # before doing so. See README "Known limitations".
@@ -80,6 +113,21 @@ class Settings(BaseSettings):
     # Authorization: Bearer <key> header (or X-API-Key header) on every
     # non-health endpoint. Required whenever mcp_host is not 127.0.0.1/localhost.
     mcp_api_key: Optional[str] = None
+    # Escape hatch for container deployments that reach the server over a
+    # private docker network only: the process must bind 0.0.0.0 to be
+    # reachable from a sibling container, and the port is never published to
+    # the host. Everything else non-loopback requires mcp_api_key.
+    mcp_allow_unauthenticated: bool = False
+
+    # SmarterMail private JSON API (scheduled send, signatures, notes, file
+    # storage, virtual folders, domain administration). Off by default because
+    # the tools only work against a SmarterMail server. Base URL defaults to
+    # the host of ews_server_url; credentials are the mailbox passwords the
+    # EWS side already uses. Admin tools need a second opt-in because they
+    # can rename, disable and delete accounts.
+    smartermail_enabled: bool = False
+    smartermail_base_url: Optional[str] = None
+    smartermail_admin_tools: bool = False
     timezone: str = "UTC"
     log_level: str = "INFO"
 
@@ -102,7 +150,9 @@ class Settings(BaseSettings):
 
     # Rate limiting
     rate_limit_enabled: bool = True
-    rate_limit_requests_per_minute: int = 25
+    # Local tool-call budget. Upstream EWS throttling is handled separately
+    # (backoff in search_emails); 25/min starved multi-mailbox sweeps.
+    rate_limit_requests_per_minute: int = 120
 
     # Features
     enable_email: bool = True
@@ -207,18 +257,34 @@ class Settings(BaseSettings):
             if missing:
                 raise ValueError(f"OAuth2 auth requires: {', '.join(missing)}")
         elif self.ews_auth_type in ("basic", "ntlm"):
-            if not self.ews_username or not self.ews_password:
-                raise ValueError(f"{self.ews_auth_type.upper()} auth requires ews_username and ews_password")
-
-        # SSE transport binding safety: require API key if not loopback.
-        if self.mcp_transport == "sse":
-            loopback_hosts = {"127.0.0.1", "::1", "localhost"}
-            if self.mcp_host not in loopback_hosts and not self.mcp_api_key:
+            if not self.ews_username:
+                raise ValueError(f"{self.ews_auth_type.upper()} auth requires ews_username")
+            # ews_password may instead come from the ews_email row in the
+            # Supabase accounts table; only hard-require it when there is no
+            # table to fall back to.
+            supabase_configured = bool(self.supabase_url and self.supabase_service_key)
+            if not self.ews_password and not supabase_configured:
                 raise ValueError(
-                    "SSE transport bound to a non-loopback address requires "
-                    "MCP_API_KEY to be set. Either set MCP_API_KEY or bind "
-                    "MCP_HOST to 127.0.0.1 and put the server behind an "
-                    "auth-enforcing reverse proxy."
+                    f"{self.ews_auth_type.upper()} auth requires ews_password "
+                    "(or a Supabase accounts table providing the primary mailbox)"
+                )
+
+        # HTTP transport binding safety: a non-loopback bind must either
+        # require an API key or explicitly opt in to being unauthenticated.
+        if self.mcp_transport in ("sse", "streamable-http"):
+            loopback_hosts = {"127.0.0.1", "::1", "localhost"}
+            if (
+                self.mcp_host not in loopback_hosts
+                and not self.mcp_api_key
+                and not self.mcp_allow_unauthenticated
+            ):
+                raise ValueError(
+                    f"{self.mcp_transport} transport bound to a non-loopback "
+                    "address requires MCP_API_KEY to be set. Either set "
+                    "MCP_API_KEY, bind MCP_HOST to 127.0.0.1 and put the "
+                    "server behind an auth-enforcing reverse proxy, or set "
+                    "MCP_ALLOW_UNAUTHENTICATED=true if the port is only "
+                    "reachable on a private network."
                 )
 
         # Shared logger for both AI validation + transport clamping.
@@ -313,6 +379,49 @@ class Settings(BaseSettings):
         )
 
         return self
+
+    @model_validator(mode='after')
+    def load_supabase_accounts(self) -> 'Settings':
+        """Populate the mailbox rows from the Supabase accounts table (sole source).
+
+        ``mail_account_rows`` keeps every row verbatim (including the optional
+        ``provider`` / ``settings`` columns) for the mailbox registry, while
+        ``ews_accounts`` is filtered down to the Exchange mailboxes so the
+        existing EWS tools never try to open an iCloud/Outlook mailbox over EWS.
+        """
+        if not (self.supabase_url and self.supabase_service_key):
+            return self
+        from .accounts_store import load_account_rows, ews_passwords
+
+        self.mail_account_rows = load_account_rows(
+            self.supabase_url, self.supabase_service_key, self.ews_accounts_table
+        )
+        self.ews_accounts = ews_passwords(self.mail_account_rows)
+        # Warn (don't crash) if the primary mailbox has no password anywhere —
+        # EWS_PASSWORD is unset and its row is missing from the table.
+        if self.ews_auth_type in ("basic", "ntlm") and self.get_primary_password() is None:
+            import logging
+            logging.getLogger(__name__).warning(
+                "No password for primary mailbox %s: EWS_PASSWORD unset and no "
+                "matching row in the %s table. Primary mailbox calls will fail.",
+                self.ews_email, self.ews_accounts_table,
+            )
+        return self
+
+    def get_primary_password(self) -> Optional[str]:
+        """Resolve the primary mailbox password.
+
+        Prefers the env EWS_PASSWORD; falls back to the ews_email row in the
+        Supabase accounts table (case-insensitive), so table-only deployments
+        need no password in the environment.
+        """
+        if self.ews_password:
+            return self.ews_password
+        target = (self.ews_email or "").lower()
+        for email, pw in self.ews_accounts.items():
+            if email.lower() == target:
+                return pw
+        return None
 
     def get_api_base_urls(self) -> list[dict[str, str]]:
         """Get API base URLs for OpenAPI schema.

@@ -1,13 +1,14 @@
-> **Legacy 4.0 documentation** — this page describes the `src/` server
-> that ships as `ghcr.io/azizmazrou/ews-mcp:latest`. For the current
-> 4.5 line see [`v5/README.md`](../../v5/README.md) and
-> [`v5/docs/API.md`](../../v5/docs/API.md).
+> **Legacy 4.0 documentation.** This page describes the `src/` server as
+> extended by this fork. Upstream's `ghcr.io/azizmazrou/ews-mcp:latest` image
+> does not include the fork's additions, and the fork publishes no image (see
+> the [README](../../README.md#quick-start)). For upstream's 4.5 line see
+> [`v5/README.md`](../../v5/README.md) and [`v5/docs/API.md`](../../v5/docs/API.md).
 
 # Troubleshooting Guide
 
 Common issues and solutions for the EWS MCP Server.
 
-> **Note:** Many earlier GAL 0-results / recipient-resolution issues are resolved by the multi-strategy `find_person` search. When in doubt, call `find_person` with `source="all"` — it falls back across GAL, contacts, and email history.
+> **Note:** Exchange `find_person(source="all")` searches GAL, contacts and email history. On Graph and iCloud/CardDAV, `all` explicitly reports contacts-only partial coverage; GAL/history/domain search and contact analytics are unsupported.
 
 ## Authentication Issues
 
@@ -181,9 +182,10 @@ docker-compose up --build
 **Common Causes:**
 
 1. **Invalid Item IDs:**
-   - Item IDs expire or become invalid
-   - Use search to find current IDs
-   - Don't cache IDs for long periods
+   - Keep each ID paired with its `target_mailbox` and `folder`; IMAP IDs are folder-scoped, not portable mailbox handles.
+   - IMAP draft body/subject and attachment mutations rewrite the message. Use the returned fresh `id`/`message_id` and attachment part IDs, or re-list attachments before the next mutation.
+   - If a rewrite cannot identify its replacement, re-list Drafts. Never assume the old ID identifies the new message or retry the mutation blindly.
+   - Use search/list tools for current IDs rather than caching them indefinitely.
 
 2. **Permissions Issues:**
    - Verify app has required permissions
@@ -208,23 +210,106 @@ docker-compose up --build
    - Test with a simple email first
 
 2. **Attachment Issues:**
-   - Verify file paths are accessible
-   - Check file size under MAX_ATTACHMENT_SIZE (150MB default)
-   - Ensure files exist and are readable
+   - Use canonical `files`. Remote agents (e.g. behind an MCP gateway) share no filesystem with the server: send base64 `file_content` + `file_name`, a `file_url`, or call `stage_outgoing_file` and pass its returned `file_path`. A `File not found on the Email MCP server` error means a caller-side path was used; the response's `hint` lists the alternatives.
+   - Smoke-test attachments with `dry_run=true, verify_files=true` on `send_email`, `reply_email` or `forward_email` — nothing is sent.
+   - Legacy `attachments`/`inline_attachments` remain supported only on their existing Exchange paths and are deprecated. Graph/IMAP reject them.
+   - URL and SmarterMail-storage fetches are capped at **25 MiB per file**. Graph send/reply/forward and draft creators reject more than **3 MiB total raw bytes** in newly supplied `files`; mail-server limits also apply. Large Graph upload sessions are not implemented.
+   - `MAX_ATTACHMENT_SIZE` is not currently enforced by these outbound paths. Local-path/base64 sources do not use the remote-fetch cap.
+   - Oversized files do not automatically become links. Explicitly put an externally hosted download link in the body; `attach_file_link` generates links only for SmarterMail storage.
 
 3. **Recipient Validation:**
    - Use valid email addresses
    - Check recipient exists in organization
    - Verify no send restrictions
 
+### Problem: Graph failed after creating a draft
+
+A multi-step create/upload/send failure is not necessarily an empty operation.
+Inspect the structured `success:false` result: `draft_id` when known, `mailbox`,
+`folder`, `stage`, `sent:false`, cleanup information and submission uncertainty.
+New drafts are retained by default. Inspect attachments before recovering from
+a partial upload, and reuse the retained draft rather than creating duplicates.
+Optional `cleanup_on_failure=true` only requests deletion of drafts created by
+the current call; it must never delete an existing caller-supplied draft.
+If submission is uncertain, reconcile with the provider before resending or
+deleting the draft. A missing recovery ID can mean creation failed before an
+ID was received; it is not proof that the provider created nothing.
+
+For IMAP draft creation, a post-creation metadata/relisting failure can also
+leave a draft. `cleanup_on_failure` defaults to false; true requests targeted
+cleanup only when the newly created draft's ID is known. If its ID is unknown,
+re-list Drafts rather than guessing. Existing caller drafts are never eligible
+for this cleanup option.
+
+### Problem: SMTP accepted mail, but sending reported warnings
+
+Submission is not delivery: `accepted_by_mail_server` does not override
+`delivery_confirmed:false`. Inspect `accepted_recipients`,
+`refused_recipients` and `partial_failure`; do not retry all recipients after
+partial acceptance. Failure to save a Sent copy or clean up a draft also does
+not undo submission. A network timeout may leave acceptance unknown; neither
+an error nor a remaining draft proves that resending is safe.
+
+### Problem: A tool works for one mailbox but not another
+
+Use `list_mailboxes` and the selected mailbox's capabilities, not merely the
+server-wide tool list. Mail and draft tools are provider-unified; core calendar
+and contact operations support Graph with separately consented scopes and
+iCloud/DAV with CalDAV/CardDAV discovery or configured URLs. Graph free/busy and
+meeting suggestions require an organization account, not a personal Microsoft
+account. CalDAV/CardDAV supports event/contact CRUD, not organization free/busy
+or contact analytics. Tasks/contact analytics remain Exchange-only.
+Scheduling/undo require SmarterMail REST.
+See [provider scope](API.md#conventions).
+
+Graph event/contact HTTP 403 with a valid mail token can mean missing
+`Calendars.ReadWrite` / `Contacts.ReadWrite` consent for the selected app/account.
+Refreshing a token does not add permissions. Obtain user/admin consent and
+re-authenticate. On refresh the backend requests the account's
+`settings.graph_scope`, or by default `offline_access`, `User.Read`, the mail
+scopes, `Calendars.ReadWrite` and `Contacts.ReadWrite`. A custom
+`settings.graph_scope` must include the calendar/contact scopes too (see the
+[scope configuration example](API.md#calendar)). App-only accounts request
+`https://graph.microsoft.com/.default`, so the app's application permissions
+apply. Never silently modify stored credentials or scopes.
+Graph `find_person`
+scans only default contacts and reports truncation at its scan limit. A partial
+or truncated result is not proof that a person is absent from the directory.
+
+### Problem: Scheduling failed or cancellation did not confirm
+
+Native `schedule_email` supports `files` and saved EWS `draft_id` only for
+SmarterMail-backed Exchange. With a draft ID, omit every compose override
+(`to`, `cc`, `bcc`, `subject`, `body`, `body_format`); edit first with
+`update_draft`. The native Scheduled queue consumes the source draft and
+returns a numeric Scheduled UID for cancellation, not an EWS message ID.
+
+After a mutation/submission failure, inspect `draft_id`, `uid`, `folder`,
+`stage`, `submission_uncertain` and `recovery_hint`. Files may already have
+appended to an existing draft; that source is never deleted as failure cleanup.
+If native submission was attempted, check both Drafts and Scheduled before
+retrying: the source may already have moved and the operation may have queued.
+Do not infer non-delivery from an error or a missing Drafts item.
+
+`cancel_scheduled_email` scans the whole queue and requests removal, not
+guaranteed prevention. Observed removal reports `removed_from_queue:true`,
+`cancelled:null`, `cancellation_confirmed:false`, `delivery_prevented:null`.
+An item absent beforehand may already have sent. A requested soft move may
+return no destination IDs, so `moved_to_deleted` remains unknown without
+evidence. Native `undo_send` acknowledgment also cannot prove delivery stopped:
+the provider may acknowledge even an absent UID. Neither operation is recall,
+a portable Graph/IMAP scheduler or an exactly-once delivery guarantee.
+
 ### Problem: find_person returns 0 results for GAL search
 
-The current `find_person` tool uses a multi-strategy GAL search that
-should never return 0 hits when matching people exist. If you do see
-0 results, check authentication and impersonation rights first
-([Authentication Issues](#authentication-issues) above).
+On Exchange, `find_person` uses multi-strategy GAL search; check query scope,
+authentication and impersonation rights when expected people are missing
+([Authentication Issues](#authentication-issues) above). On Graph, use
+`source="contacts"`: `all` reports contacts-only partial coverage, while an
+explicit GAL/history/domain request is unsupported rather than a zero-match
+search. A working mail login does not establish calendar/contact permissions.
 
-**Multi-strategy search:**
+**Exchange multi-strategy search:**
 1. **Exact match** — direct EWS `ResolveNames` SOAP call
 2. **Partial match** — wildcard / prefix search
 3. **Domain search** — `@domain` → all users at that domain

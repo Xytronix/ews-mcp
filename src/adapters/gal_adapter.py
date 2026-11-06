@@ -402,7 +402,11 @@ class GALAdapter:
             persons = []
             query_lower = query.lower()
             try:
-                contacts = self.ews_client.account.contacts.all()
+                # .only(): SmarterMail refuses mime_content for contacts.
+                contacts = self.ews_client.account.contacts.all().only(
+                    "display_name", "given_name", "surname",
+                    "email_addresses", "company_name", "job_title",
+                )
                 for contact in list(contacts)[:100]:  # Limit for performance
                     try:
                         # Check if query matches

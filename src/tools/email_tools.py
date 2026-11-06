@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from datetime import datetime
-from exchangelib import Message, Mailbox, FileAttachment, HTMLBody, Body, Folder, ExtendedProperty
+from exchangelib import Message, Mailbox, FileAttachment, ItemAttachment, HTMLBody, Body, Folder, ExtendedProperty
 from exchangelib.errors import ErrorTimeoutExpired
 from exchangelib.queryset import Q
 
@@ -16,7 +16,9 @@ class FlagStatus(ExtendedProperty):
     property_tag = 0x1090
     property_type = 'Integer'
 
-# Register the flag property on Message class
+
+# Register the flag property on Message class. ``outbound_tracking_id`` is
+# registered in ``src.utils`` alongside the header constant.
 Message.register('flag_status_value', FlagStatus)
 
 # Mapping from string flag_status to integer values
@@ -31,17 +33,26 @@ from .base import BaseTool
 from ..models import SendEmailRequest, EmailSearchRequest, EmailDetails
 from ..exceptions import ToolExecutionError, ValidationError
 from ..utils import (
+    iso_or_none, item_text_body, sender_matches, is_full_address,
     format_success_response, safe_get, truncate_text, parse_datetime_tz_aware,
     find_message_across_folders, find_message_for_account, ews_id_to_str,
     attach_inline_files, INLINE_ATTACHMENTS_SCHEMA,
     escape_html, format_body_for_html, sanitize_html,
     project_fields, ensure_snippet, strip_body_by_default, LIST_DEFAULT_FIELDS,
-    ews_call_log,
+    ews_call_log, new_outbound_tracking_id,
 )
 from .folder_tools import find_folder_by_id, get_standard_folder_map
+from .attachment_tools import build_embedded_message
+from .outgoing_attachments import (
+    FILES_SCHEMA, VERIFY_FILES_SCHEMA, attach_outgoing_files, dry_run_file_report,
+    dry_run_schema, load_outgoing_files, validate_outgoing_files,
+)
+from ..attachment_sources import REMOTE_AGENT_HINT, REMOTE_AGENT_POINTER
+from .smartermail_base import smartermail_client
 
 # v4.0 — bidirectional body format schema fragments (read + write)
 from ..body_format import (
+    DEFAULT_READ_FORMAT,
     READ_FORMAT_SCHEMA,
     WRITE_FORMAT_SCHEMA as BODY_FORMAT_SCHEMA,  # local alias used by email tools
     render_body,
@@ -97,9 +108,9 @@ _DB_FIELDS_BY_PUBLIC: Dict[str, tuple] = {
     "categories": ("categories",),
     # Snippet/preview/body all derive from text_body + body; include both
     # so exchangelib fetches the HTML body too when callers ask for body.
-    "snippet": ("text_body",),
-    "preview": ("text_body",),
-    "body_preview": ("text_body",),
+    "snippet": ("text_body", "body"),
+    "preview": ("text_body", "body"),
+    "body_preview": ("text_body", "body"),
     "body": ("text_body", "body"),
     "body_html": ("body",),
     "conversation_id": ("conversation_id",),
@@ -164,7 +175,10 @@ def _classify_ews_error(exc: BaseException) -> str:
     """
     name = type(exc).__name__
     msg = str(exc)
-    if name == "ErrorServerBusy" or "throttl" in msg.lower() or "ServerBusy" in msg:
+    low = msg.lower()
+    if (name in ("ErrorServerBusy", "RateLimitError") or "throttl" in low
+            or "ServerBusy" in msg or "429" in msg or "too many requests" in low
+            or "rate limit" in low):
         return "THROTTLED"
     if name in _TRANSIENT_EWS_ERROR_NAMES or "timed out" in msg.lower():
         return "TIMEOUT"
@@ -173,6 +187,73 @@ def _classify_ews_error(exc: BaseException) -> str:
     if name in _CONNECTION_EWS_ERROR_NAMES or "Connection aborted" in msg:
         return "CONNECTION"
     return "UNKNOWN"
+
+
+# --- Throttling (EWS ErrorServerBusy / HTTP 429) ---------------------------
+# Hosted SmarterMail servers can enforce roughly 25 EWS requests/minute per
+# mailbox. Searches are serialized process-wide (multi-mailbox fan-out from
+# one agent no longer bursts), and THROTTLED failures — raised or reported
+# via meta.error_code — are retried with exponential backoff.
+_SEARCH_LOCK: Optional[Any] = None
+THROTTLE_MAX_RETRIES = int(os.environ.get("EWS_THROTTLE_MAX_RETRIES", "4"))
+THROTTLE_BASE_DELAY = float(os.environ.get("EWS_THROTTLE_BASE_DELAY", "3"))
+THROTTLE_MAX_DELAY = float(os.environ.get("EWS_THROTTLE_MAX_DELAY", "30"))
+
+
+def _search_lock():
+    import asyncio
+    global _SEARCH_LOCK
+    if _SEARCH_LOCK is None:
+        _SEARCH_LOCK = asyncio.Lock()
+    return _SEARCH_LOCK
+
+
+def _result_throttled(result: Any) -> bool:
+    if not isinstance(result, dict):
+        return False
+    meta = result.get("meta") or {}
+    if meta.get("error_code") == "THROTTLED":
+        return True
+    return any(e.get("error_code") == "THROTTLED"
+               for e in (meta.get("per_folder_errors") or []) if isinstance(e, dict))
+
+
+def _exc_throttled(exc: BaseException) -> bool:
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if _classify_ews_error(exc) == "THROTTLED":
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+async def run_throttled(factory, logger: Optional[logging.Logger] = None,
+                        *, sleep=None, max_retries: Optional[int] = None):
+    """Run ``await factory()`` under the search lock, retrying throttling."""
+    import asyncio
+    sleep = sleep or asyncio.sleep
+    retries = THROTTLE_MAX_RETRIES if max_retries is None else max_retries
+    async with _search_lock():
+        attempt = 0
+        while True:
+            try:
+                result = await factory()
+                throttled = _result_throttled(result)
+                err = None
+            except Exception as exc:  # noqa: BLE001
+                if not _exc_throttled(exc):
+                    raise
+                throttled, err, result = True, exc, None
+            if not throttled or attempt >= retries:
+                if err is not None:
+                    raise err
+                return result
+            delay = min(THROTTLE_MAX_DELAY, THROTTLE_BASE_DELAY * (2 ** attempt))
+            attempt += 1
+            if logger:
+                logger.warning("EWS throttled; retry %d/%d in %.0fs", attempt, retries, delay)
+            await sleep(delay)
 
 
 @dataclass
@@ -261,6 +342,82 @@ def _paginate_query(
     return outcome
 
 
+def _subject_search_matcher(subject_contains: Optional[str] = None):
+    """Build a local verifier for EWS subject restrictions.
+
+    SmarterMail accepts EWS ``Contains`` restrictions but can ignore them and
+    return the entire folder. Keeping the server restriction is useful on real
+    Exchange; this verifier guarantees the public result still matches it.
+    """
+    needle = (subject_contains or "").casefold()
+    if not needle:
+        return None
+
+    def matches(email: Any) -> bool:
+        subject = str(safe_get(email, "subject", "") or "").casefold()
+        return needle in subject
+
+    return matches
+
+
+def _with_subject_search_field(
+    only_fields: tuple,
+    subject_contains: Optional[str] = None,
+) -> tuple:
+    """Include the subject needed to verify an EWS restriction locally."""
+    fields = list(only_fields)
+    if subject_contains and "subject" not in fields:
+        fields.append("subject")
+    return tuple(fields)
+
+
+def _paginate_query_matching(
+    query: Any,
+    *,
+    matcher: Any,
+    max_results: int,
+    offset: int,
+    chunk_size: int,
+    logger: logging.Logger,
+    folder_label: str,
+) -> FolderQueryOutcome:
+    """Scan a possibly-unrestricted EWS result and keep verified matches."""
+    outcome = FolderQueryOutcome()
+    target_offset = max(0, int(offset))
+    limit = max(0, int(max_results))
+    chunk_size = max(1, min(chunk_size, 250))
+    cursor = 0
+    matched = 0
+
+    while True:
+        try:
+            batch = list(query[cursor:cursor + chunk_size])
+        except Exception as exc:
+            code = _classify_ews_error(exc)
+            logger.warning(
+                "paginate matching %s offset=%d chunk=%d raised %s: %s",
+                folder_label, cursor, chunk_size, type(exc).__name__, exc,
+            )
+            outcome.error_code = code
+            outcome.error_message = f"{type(exc).__name__}: {exc}"
+            outcome.total_available = None
+            return outcome
+        if not batch:
+            break
+        for email in batch:
+            if not matcher(email):
+                continue
+            if matched >= target_offset and len(outcome.items) < limit:
+                outcome.items.append(email)
+            matched += 1
+        cursor += len(batch)
+        if len(batch) < chunk_size:
+            break
+
+    outcome.total_available = matched
+    return outcome
+
+
 def _build_list_item(
     email: Any,
     *,
@@ -275,9 +432,8 @@ def _build_list_item(
     from_email = ""
     if sender and hasattr(sender, "email_address"):
         from_email = sender.email_address or ""
-    text_body = safe_get(email, "text_body", "") or ""
-    received = safe_get(email, "datetime_received", None)
-    received_iso = received.isoformat() if received and hasattr(received, "isoformat") else None
+    text_body = item_text_body(email)
+    received_iso = iso_or_none(safe_get(email, "datetime_received", None))
     item = {
         "message_id": ews_id_to_str(safe_get(email, "id", None)) or "",
         "subject": safe_get(email, "subject", "") or "",
@@ -595,10 +751,8 @@ def copy_attachments_to_message(original_message, new_message) -> tuple:
     Returns:
         Tuple of (inline_count, regular_count)
     """
-    # Check if target message supports attach method
-    # ReplyToItem/ReplyAllToItem objects from create_reply() don't support attach
-    if not hasattr(new_message, 'attach') or not callable(getattr(new_message, 'attach', None)):
-        return 0, 0
+    # Let unreadable or unsupported attachments fail the operation instead of
+    # sending a message that silently omits part of the original.
 
     attachments = safe_get(original_message, "attachments", []) or []
     if not attachments:
@@ -608,29 +762,32 @@ def copy_attachments_to_message(original_message, new_message) -> tuple:
     regular_count = 0
 
     for att in attachments:
-        if not att or not isinstance(att, FileAttachment):
-            continue
-
-        try:
-            # Create new attachment preserving ALL properties
-            # CRITICAL: content_id is needed for cid: references in HTML
-            # CRITICAL: is_inline marks the attachment as embedded
-            new_att = FileAttachment(
-                name=att.name,
-                content=att.content,
-                content_type=getattr(att, 'content_type', None),
-                content_id=getattr(att, 'content_id', None),  # Preserve for cid: refs
-                is_inline=getattr(att, 'is_inline', False)     # Preserve inline flag
-            )
-            new_message.attach(new_att)
-
-            if getattr(att, 'is_inline', False):
-                inline_count += 1
-            else:
-                regular_count += 1
-        except (AttributeError, TypeError):
-            # Target message doesn't support attach - skip
-            return inline_count, regular_count
+        metadata = {
+            "name": att.name,
+            "content_type": att.content_type,
+            "content_id": att.content_id,
+            "content_location": att.content_location,
+            "is_inline": att.is_inline,
+        }
+        if isinstance(att, FileAttachment):
+            new_att = FileAttachment(content=att.content, **metadata)
+        elif isinstance(att, ItemAttachment):
+            source_item = att.item
+            if not isinstance(source_item, Message):
+                raise ToolExecutionError(
+                    f"Cannot preserve embedded {type(source_item).__name__} attachment: {att.name}"
+                )
+            item, fidelity = build_embedded_message(new_message.account, source_item)
+            if fidelity == "fields":
+                copy_attachments_to_message(source_item, item)
+            new_att = ItemAttachment(item=item, **metadata)
+        else:
+            raise ToolExecutionError(f"Unsupported original attachment: {att.name}")
+        new_message.attach(new_att)
+        if att.is_inline:
+            inline_count += 1
+        else:
+            regular_count += 1
 
     return inline_count, regular_count
 
@@ -796,13 +953,32 @@ async def resolve_folder(ews_client, folder_identifier: str):
 class SendEmailTool(BaseTool):
     """Tool for sending emails."""
 
+    _COMPOSE_FIELDS = (
+        "to", "subject", "body", "cc", "bcc", "importance",
+        "attachments", "inline_attachments", "body_format", "files",
+    )
+
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "send_email",
-            "description": "Send an email with optional attachments and CC/BCC.",
+            "description": (
+                "Send a new email, or send an existing draft as-is with draft_id. "
+                "Draft sends preserve stored recipients, body and attachments; "
+                "do not pass compose fields with draft_id."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "draft_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "pattern": "\\S",
+                        "description": (
+                            "Existing draft message ID to send unchanged. Omit "
+                            "to/subject/body and all other compose fields. "
+                            "Use target_mailbox for the mailbox holding the draft."
+                        ),
+                    },
                     "to": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -829,13 +1005,14 @@ class SendEmailTool(BaseTool):
                     "importance": {
                         "type": "string",
                         "enum": ["Low", "Normal", "High"],
-                        "description": "Email importance level (optional)"
+                        "description": "Exchange-only email importance level (optional)"
                     },
                     "attachments": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Attachment file paths (optional)"
+                        "description": "Exchange-only server-local file paths; use files on any supported provider."
                     },
+                    "files": FILES_SCHEMA,
                     **INLINE_ATTACHMENTS_SCHEMA,
                     **BODY_FORMAT_SCHEMA,
                     "target_mailbox": {
@@ -846,18 +1023,86 @@ class SendEmailTool(BaseTool):
                         "type": "boolean",
                         "default": False,
                         "description": (
-                            "When true, validate inputs and build the Message object but DO NOT send. "
-                            "Returns the computed subject/recipients/body preview. Useful for AI agents "
-                            "that want to 'what would this send' before committing."
+                            "Preview without sending or modifying a message. With draft_id, reads "
+                            "the existing draft and returns stored recipients, subject and a body preview. "
+                            "Compose-mode files are validated but not fetched unless verify_files=true."
                         )
-                    }
+                    },
+                    "verify_files": VERIFY_FILES_SCHEMA,
                 },
-                "required": ["to", "subject", "body"]
+                "required": [],
+                "oneOf": [
+                    {
+                        "required": ["draft_id"],
+                        "not": {"anyOf": [
+                            {"required": [field]} for field in self._COMPOSE_FIELDS
+                        ]},
+                    },
+                    {
+                        "required": ["to", "subject", "body"],
+                        "not": {"required": ["draft_id"]},
+                    },
+                ],
             }
         }
 
+    def _draft_id(self, kwargs: Dict[str, Any]) -> Optional[str]:
+        if "draft_id" not in kwargs:
+            return None
+        draft_id = kwargs["draft_id"]
+        if not isinstance(draft_id, str) or not draft_id.strip():
+            raise ValidationError("draft_id must be a non-empty message ID")
+        overrides = [field for field in self._COMPOSE_FIELDS if field in kwargs]
+        if overrides:
+            raise ValidationError(
+                "draft_id sends the stored draft as-is; omit " + ", ".join(overrides)
+            )
+        return draft_id
+
+    def _send_draft(
+        self, draft_id: str, target_mailbox: Optional[str], dry_run: bool
+    ) -> Dict[str, Any]:
+        try:
+            account = self.get_account(target_mailbox)
+            draft = find_message_for_account(account, draft_id)
+            if not isinstance(draft, Message) or draft.is_draft is not True:
+                raise ValidationError("draft_id must identify an unsent draft message")
+            mailbox = self.get_mailbox_info(target_mailbox)
+            recipients = [r.email_address for r in (draft.to_recipients or [])]
+            if dry_run:
+                body = str(draft.body or "")
+                return format_success_response(
+                    "Dry run — no email sent",
+                    dry_run=True, sent=False, draft_id=draft_id,
+                    would_send_to=recipients,
+                    would_cc=[r.email_address for r in (draft.cc_recipients or [])],
+                    would_bcc=[r.email_address for r in (draft.bcc_recipients or [])],
+                    subject=draft.subject,
+                    body_preview=body[:280] + ("..." if len(body) > 280 else ""),
+                    attachments_count=len(draft.attachments or []),
+                    mailbox=mailbox,
+                )
+            # A saved Message uses SendItem, preserving server-side content.
+            # send_and_save() would update writable fields instead.
+            draft.send()
+            return format_success_response(
+                "Draft accepted by mail server; final delivery not yet confirmed",
+                draft_id=draft_id, sent=True,
+                accepted_by_mail_server=True, delivery_confirmed=False,
+                recipients=recipients, mailbox=mailbox,
+            )
+        except (ValidationError, ToolExecutionError):
+            raise
+        except Exception as exc:
+            raise ToolExecutionError(f"Failed to send draft: {exc}") from exc
+
     async def execute(self, **kwargs) -> Dict[str, Any]:
         """Send email via EWS."""
+        draft_id = self._draft_id(kwargs)
+        if draft_id is not None:
+            return self._send_draft(
+                draft_id, kwargs.get("target_mailbox"), bool(kwargs.get("dry_run", False))
+            )
         # Get target mailbox for impersonation
         target_mailbox = kwargs.pop("target_mailbox", None)
         dry_run = bool(kwargs.pop("dry_run", False))
@@ -874,9 +1119,15 @@ class SendEmailTool(BaseTool):
         request = self.validate_input(SendEmailRequest, **kwargs)
 
         try:
+            files = validate_outgoing_files(kwargs.get("files"))
+            fetch_files = not dry_run or bool(kwargs.get("verify_files"))
+            outgoing_files = await load_outgoing_files(
+                files, storage_client=lambda: smartermail_client(self.ews_client, target_mailbox)
+            ) if fetch_files else []
             # Get account (primary or impersonated)
             account = self.get_account(target_mailbox)
             mailbox = self.get_mailbox_info(target_mailbox)
+            tracking_id = new_outbound_tracking_id()
 
             # Clean and prepare email body
             email_body = request.body.strip()
@@ -904,6 +1155,8 @@ class SendEmailTool(BaseTool):
             if is_html:
                 message = Message(
                     account=account,
+                    author=Mailbox(email_address=account.primary_smtp_address),
+                    outbound_tracking_id=tracking_id,
                     subject=request.subject,
                     body=HTMLBody(email_body),
                     to_recipients=[Mailbox(email_address=email) for email in request.to]
@@ -912,6 +1165,8 @@ class SendEmailTool(BaseTool):
             else:
                 message = Message(
                     account=account,
+                    author=Mailbox(email_address=account.primary_smtp_address),
+                    outbound_tracking_id=tracking_id,
                     subject=request.subject,
                     body=Body(email_body),
                     to_recipients=[Mailbox(email_address=email) for email in request.to]
@@ -954,7 +1209,7 @@ class SendEmailTool(BaseTool):
                             attachment_count += 1
                             self.logger.info(f"Attached file: {file_name} ({len(content)} bytes)")
                     except FileNotFoundError:
-                        raise ToolExecutionError(f"Attachment file not found: {file_path}")
+                        raise ToolExecutionError(f"Attachment file not found on the Email MCP server: {file_path}. {REMOTE_AGENT_POINTER}", hint=REMOTE_AGENT_HINT)
                     except PermissionError:
                         raise ToolExecutionError(f"Permission denied reading attachment: {file_path}")
                     except Exception as e:
@@ -967,6 +1222,7 @@ class SendEmailTool(BaseTool):
             if inline_count > 0:
                 attachment_count += inline_count
                 self.logger.info(f"Added {inline_count} inline (base64) attachment(s)")
+            attachment_count += attach_outgoing_files(message, outgoing_files)
 
             # Dry-run short-circuit: return a preview of what WOULD be sent
             # without actually calling message.send(). Nothing is persisted
@@ -988,13 +1244,18 @@ class SendEmailTool(BaseTool):
                     body_preview=body_preview,
                     body_type=body_type,
                     attachments_count=attachment_count,
+                    would_attach=attachment_count + (0 if fetch_files else len(files)),
+                    **dry_run_file_report(files, outgoing_files if fetch_files else None),
                     importance=request.importance.value,
                     mailbox=mailbox,
                 )
 
             # Send the message (attachments are included automatically)
             message.send()
-            self.logger.info(f"Message sent to {', '.join(request.to)} with {attachment_count} attachment(s)")
+            self.logger.info(
+                f"Mail server accepted message {tracking_id} to "
+                f"{', '.join(request.to)} with {attachment_count} attachment(s)"
+            )
 
             # FINAL VERIFICATION: Check message body after send
             if hasattr(message, 'body') and message.body and len(str(message.body).strip()) > 0:
@@ -1010,13 +1271,18 @@ class SendEmailTool(BaseTool):
                 )
 
             return format_success_response(
-                "Email sent successfully",
+                "Email accepted by mail server; final delivery not yet confirmed",
                 message_id=ews_id_to_str(message.id) if hasattr(message, 'id') else None,
+                tracking_id=tracking_id,
+                accepted_by_mail_server=True,
+                delivery_confirmed=False,
                 sent_time=datetime.now().isoformat(),
                 recipients=request.to,
                 mailbox=mailbox
             )
 
+        except (ValidationError, ToolExecutionError):
+            raise
         except Exception as e:
             self.logger.error(f"Failed to send email: {e}")
             raise ToolExecutionError(f"Failed to send email: {e}")
@@ -1065,8 +1331,9 @@ class ReadEmailsTool(BaseTool):
         target_mailbox = kwargs.get("target_mailbox")
         # v4.0: format/include_body affect the per-item shape. Backward
         # compatible — defaults match v3.4 (preview only, no full body).
-        fmt = kwargs.get("format", "html")
-        include_body = bool(kwargs.get("include_body", True))
+        fmt = kwargs.get("format") or "html"
+        # Body only on explicit opt-in (preview-only default, as in v3.4).
+        include_body = kwargs.get("include_body") is True
 
         try:
             # Get account (primary or impersonated)
@@ -1092,8 +1359,8 @@ class ReadEmailsTool(BaseTool):
                 if sender and hasattr(sender, "email_address"):
                     from_email = sender.email_address or ""
 
-                # Get text body safely
-                text_body = safe_get(item, "text_body", "") or ""
+                # Get text body safely (falls back to HTML body / MIME)
+                text_body = item_text_body(item)
 
                 email_data = {
                     "message_id": ews_id_to_str(safe_get(item, "id", None)) or "unknown",
@@ -1102,11 +1369,19 @@ class ReadEmailsTool(BaseTool):
                     "to": [r.email_address for r in (safe_get(item, "to_recipients", []) or []) if r and hasattr(r, "email_address") and r.email_address],
                     "cc": [r.email_address for r in (safe_get(item, "cc_recipients", []) or []) if r and hasattr(r, "email_address") and r.email_address],
                     "bcc": [r.email_address for r in (safe_get(item, "bcc_recipients", []) or []) if r and hasattr(r, "email_address") and r.email_address],
-                    "received_time": safe_get(item, "datetime_received", datetime.now()).isoformat(),
+                    "received_time": iso_or_none(safe_get(item, "datetime_received", None)),
                     "is_read": safe_get(item, "is_read", False),
                     "has_attachments": safe_get(item, "has_attachments", False),
                     "preview": truncate_text(text_body, 200)
                 }
+                if include_body:
+                    html_raw = str(safe_get(item, "body", "") or "")
+                    try:
+                        body_value, body_fmt = render_body(html_raw, text_body, fmt)
+                    except ValueError:
+                        body_value, body_fmt = text_body, "text"
+                    email_data["body"] = body_value or text_body
+                    email_data["body_format"] = body_fmt
                 emails.append(email_data)
 
             self.logger.info(f"Retrieved {len(emails)} emails from {folder_name} in mailbox: {mailbox}")
@@ -1326,16 +1601,17 @@ class SearchEmailsTool(BaseTool):
         )
 
     async def execute(self, **kwargs) -> Dict[str, Any]:
-        """Route to appropriate search mode."""
+        """Route to appropriate search mode (serialized, throttle-aware)."""
         self._validate_kwargs(kwargs)
         mode = kwargs.get("mode", "quick")
 
         if mode == "advanced":
-            return await self._search_advanced(**kwargs)
+            run = self._search_advanced
         elif mode == "full_text":
-            return await self._search_full_text(**kwargs)
+            run = self._search_full_text
         else:
-            return await self._search_quick(**kwargs)
+            run = self._search_quick
+        return await run_throttled(lambda: run(**dict(kwargs)), self.logger)
 
     async def _search_quick(self, **kwargs) -> Dict[str, Any]:
         """Quick search: filter by subject, sender, date, read status, attachments.
@@ -1357,6 +1633,7 @@ class SearchEmailsTool(BaseTool):
         subject_contains = kwargs.get("subject_contains")
         body_contains = kwargs.get("body_contains")
         free_text = kwargs.get("query")
+        text_matcher = _subject_search_matcher(subject_contains)
 
         try:
             account = self.get_account(target_mailbox)
@@ -1400,8 +1677,16 @@ class SearchEmailsTool(BaseTool):
                 query = query.filter(
                     Q(subject__contains=free_text) | Q(body__contains=free_text)
                 )
-            if from_address:
+            if from_address and is_full_address(from_address):
                 query = query.filter(sender=from_address)
+            elif from_address:
+                # Partial sender ("anthropic.com", "@x.de", a name): EWS has no
+                # substring restriction on Mailbox fields, so verify locally.
+                _base_matcher = text_matcher
+                _needle = from_address
+
+                def text_matcher(email, _b=_base_matcher, _n=_needle):
+                    return sender_matches(email, _n) and (_b is None or _b(email))
             if to_address:
                 query = query.filter(to_recipients__contains=to_address)
             if kwargs.get("has_attachments") is not None:
@@ -1439,6 +1724,12 @@ class SearchEmailsTool(BaseTool):
             # omitted, we use the list-default (no raw body; snippet only).
             fields = kwargs.get("fields") or list(LIST_DEFAULT_FIELDS)
             only_fields = _db_fields_for(fields)
+            only_fields = _with_subject_search_field(
+                only_fields,
+                subject_contains,
+            )
+            if only_fields and from_address and "sender" not in only_fields:
+                only_fields = tuple(only_fields) + ("sender",)
             if only_fields:
                 try:
                     query = query.only(*only_fields)
@@ -1449,14 +1740,25 @@ class SearchEmailsTool(BaseTool):
 
             folder_label = safe_get(folder, "name", "inbox")
             start_time = datetime.now()
-            outcome = _paginate_query(
-                query,
-                max_results=max_results,
-                offset=offset,
-                chunk_size=50,
-                logger=self.logger,
-                folder_label=folder_label,
-            )
+            if text_matcher is None:
+                outcome = _paginate_query(
+                    query,
+                    max_results=max_results,
+                    offset=offset,
+                    chunk_size=50,
+                    logger=self.logger,
+                    folder_label=folder_label,
+                )
+            else:
+                outcome = _paginate_query_matching(
+                    query,
+                    matcher=text_matcher,
+                    max_results=max_results,
+                    offset=offset,
+                    chunk_size=50,
+                    logger=self.logger,
+                    folder_label=folder_label,
+                )
 
             emails: List[Dict[str, Any]] = [
                 _build_list_item(e, fields=fields, folder_name=folder_label)
@@ -1514,6 +1816,7 @@ class SearchEmailsTool(BaseTool):
         max_results = kwargs.get("max_results", 250)
         sort_by = kwargs.get("sort_by", "datetime_received")
         sort_order = kwargs.get("sort_order", "descending")
+        text_matcher = _subject_search_matcher(kwargs.get("subject_contains"))
 
         try:
             account = self.get_account(target_mailbox)
@@ -1542,8 +1845,12 @@ class SearchEmailsTool(BaseTool):
             if kwargs.get("keywords"):
                 kw = kwargs["keywords"]
                 q_filters.append(Q(subject__contains=kw) | Q(body__contains=kw))
+            adv_sender_needle = None
             if kwargs.get("from_address"):
-                q_filters.append(Q(sender=kwargs["from_address"]))
+                if is_full_address(kwargs["from_address"]):
+                    q_filters.append(Q(sender=kwargs["from_address"]))
+                else:
+                    adv_sender_needle = kwargs["from_address"]
             if kwargs.get("to_address"):
                 q_filters.append(Q(to_recipients__contains=kwargs["to_address"]))
             if kwargs.get("subject_contains"):
@@ -1573,17 +1880,26 @@ class SearchEmailsTool(BaseTool):
                 if end_date:
                     q_filters.append(Q(datetime_received__lte=end_date))
 
-            if not q_filters:
+            if not q_filters and not adv_sender_needle:
                 raise ToolExecutionError("No valid search filters provided for advanced mode")
 
-            combined_filter = q_filters[0]
+            combined_filter = q_filters[0] if q_filters else None
             for q_filter in q_filters[1:]:
                 combined_filter &= q_filter
+            if adv_sender_needle:
+                _adv_base = text_matcher
+
+                def text_matcher(email, _b=_adv_base, _n=adv_sender_needle):
+                    return sender_matches(email, _n) and (_b is None or _b(email))
 
             # Field projection (Bug 6). Default: no body.
             fields = kwargs.get("fields") or list(LIST_DEFAULT_FIELDS)
             offset = max(0, int(kwargs.get("offset", 0)))
             only_fields = _db_fields_for(fields)
+            only_fields = _with_subject_search_field(
+                only_fields,
+                kwargs.get("subject_contains"),
+            )
 
             all_results: List[Dict[str, Any]] = []
             per_folder_errors: List[Dict[str, Any]] = []
@@ -1598,7 +1914,12 @@ class SearchEmailsTool(BaseTool):
             for folder in folders:
                 folder_name = safe_get(folder, "name", "Unknown")
                 try:
-                    query = folder.filter(combined_filter)
+                    query = (
+                        folder.filter(combined_filter)
+                        if combined_filter is not None else folder.all()
+                    )
+                    if only_fields and adv_sender_needle and "sender" not in only_fields:
+                        only_fields = tuple(only_fields) + ("sender",)
                     if only_fields:
                         try:
                             query = query.only(*only_fields)
@@ -1628,14 +1949,25 @@ class SearchEmailsTool(BaseTool):
                     some_total_unknown = True
                     continue
 
-                outcome = _paginate_query(
-                    query,
-                    max_results=per_folder_budget,
-                    offset=offset,
-                    chunk_size=50,
-                    logger=self.logger,
-                    folder_label=folder_name,
-                )
+                if text_matcher is None:
+                    outcome = _paginate_query(
+                        query,
+                        max_results=per_folder_budget,
+                        offset=offset,
+                        chunk_size=50,
+                        logger=self.logger,
+                        folder_label=folder_name,
+                    )
+                else:
+                    outcome = _paginate_query_matching(
+                        query,
+                        matcher=text_matcher,
+                        max_results=per_folder_budget,
+                        offset=offset,
+                        chunk_size=50,
+                        logger=self.logger,
+                        folder_label=folder_name,
+                    )
                 ews_call_log(
                     self.logger, "FindItem",
                     result_count=len(outcome.items),
@@ -1950,8 +2282,8 @@ class GetEmailDetailsTool(BaseTool):
         """Get email details."""
         message_id = kwargs.get("message_id")
         target_mailbox = kwargs.get("target_mailbox")
-        fields = kwargs.get("fields")  # None -> backward-compat full shape
-        fmt = kwargs.get("format", "html")
+        fields = kwargs.get("fields")  # None -> full detail shape
+        fmt = kwargs.get("format") or DEFAULT_READ_FORMAT
         do_trim_quoted = bool(kwargs.get("trim_quoted", False))
         include_body = bool(kwargs.get("include_body", True))
 
@@ -1990,17 +2322,25 @@ class GetEmailDetailsTool(BaseTool):
             attachments = safe_get(item, "attachments", []) or []
             attachment_names = [att.name for att in attachments if att and hasattr(att, "name") and att.name]
 
-            text_body_raw = safe_get(item, "text_body", "") or ""
             html_body_raw = str(safe_get(item, "body", "") or "")
+            text_body_raw = item_text_body(item)
+            if not html_body_raw.strip() and not text_body_raw.strip():
+                # Last resort: decode the MIME source on demand.
+                try:
+                    from ..utils import mime_text_body
+                    full = account.fetch(ids=[item], only_fields=["mime_content"])
+                    full = next(iter(full), None)
+                    text_body_raw = mime_text_body(safe_get(full, "mime_content", None))
+                except Exception as mime_exc:
+                    self.logger.debug("MIME body fallback failed: %s", mime_exc)
 
-            # v4.0: bidirectional body format. Default fmt='html' keeps
-            # exact v3.4 shape (body=text_body, body_html=html_body) for
-            # backward compat. fmt='markdown' converts on-the-fly via the
-            # SQLite-cached renderer; fmt='text' returns text_body only.
+            # Default fmt='markdown' (~12x cheaper than Outlook HTML).
+            # fmt='html' is the explicit escape hatch for the raw body.
+            # fmt='text' returns text_body only.
             mid_str = ews_id_to_str(safe_get(item, "id", None)) or "unknown"
             cache = getattr(self.ews_client, "sqlite_cache", None)
             body_value = text_body_raw
-            body_format_used = "html"
+            body_format_used = DEFAULT_READ_FORMAT
             if include_body:
                 if fmt == "html":
                     body_value = html_body_raw
@@ -2042,8 +2382,9 @@ class GetEmailDetailsTool(BaseTool):
                 "body": body_value if include_body else "",
                 "body_format": body_format_used if include_body else "omitted",
                 "body_html": html_body_raw if ship_body_html else "",
-                "received_time": safe_get(item, "datetime_received", datetime.now()).isoformat(),
-                "sent_time": safe_get(item, "datetime_sent", datetime.now()).isoformat(),
+                "received_time": iso_or_none(safe_get(item, "datetime_received", None)),
+                "sent_time": iso_or_none(safe_get(item, "datetime_sent", None))
+                or iso_or_none(safe_get(item, "datetime_received", None)),
                 "is_read": safe_get(item, "is_read", False),
                 "has_attachments": safe_get(item, "has_attachments", False),
                 "importance": safe_get(item, "importance", "Normal") or "Normal",
@@ -2100,11 +2441,12 @@ class GetEmailsBulkTool(BaseTool):
                     "fields": {
                         "type": "array",
                         "items": {"type": "string"},
+                        "default": list(LIST_DEFAULT_FIELDS),
                         "description": (
-                            "Projection, same vocabulary as get_email_details. "
-                            "Default: full email shape. Use ['message_id', "
-                            "'subject', 'from', 'received_time', 'snippet'] "
-                            "for a light one."
+                            "Projection, same vocabulary as list tools. "
+                            "Default: list-shaped fields (no raw body; "
+                            "snippet only). Pass fields=[...] to opt into "
+                            "extra keys such as body / body_html."
                         ),
                     },
                     "max_messages": {
@@ -2155,7 +2497,7 @@ class GetEmailsBulkTool(BaseTool):
             )
 
         target_mailbox = kwargs.get("target_mailbox")
-        fields = kwargs.get("fields")  # None = full shape
+        fields = kwargs.get("fields") or list(LIST_DEFAULT_FIELDS)
         account = self.get_account(target_mailbox)
         mailbox = self.get_mailbox_info(target_mailbox)
 
@@ -2271,9 +2613,7 @@ class GetEmailsBulkTool(BaseTool):
             "attachments": attachment_names,
         }
         email_details["snippet"] = truncate_text(email_details["body"], 200)
-        if fields:
-            return project_fields(email_details, fields)
-        return email_details
+        return project_fields(email_details, fields)
 
 
 class DeleteEmailTool(BaseTool):
@@ -2513,18 +2853,24 @@ class UpdateEmailTool(BaseTool):
             # Find the message across common folders
             message = find_message_for_account(account, message_id)
 
-            # Track what was updated
+            # Track what was updated. The field names double as the EWS
+            # update_fields list: a bare save() asks exchangelib to update
+            # EVERY writable Message field, which pushes unloaded/unset values
+            # back to the server.
             updates = {}
+            changed_fields = []
 
             # Update read status
             if "is_read" in kwargs:
                 message.is_read = kwargs["is_read"]
                 updates["is_read"] = kwargs["is_read"]
+                changed_fields.append("is_read")
 
             # Update categories
             if "categories" in kwargs:
                 message.categories = kwargs["categories"]
                 updates["categories"] = kwargs["categories"]
+                changed_fields.append("categories")
 
             # Update flag status using ExtendedProperty
             if "flag_status" in kwargs:
@@ -2536,14 +2882,17 @@ class UpdateEmailTool(BaseTool):
                     )
                 message.flag_status_value = flag_value
                 updates["flag_status"] = kwargs["flag_status"]
+                changed_fields.append("flag_status_value")
 
             # Update importance
             if "importance" in kwargs:
                 message.importance = kwargs["importance"]
                 updates["importance"] = kwargs["importance"]
+                changed_fields.append("importance")
 
             # Save changes
-            message.save()
+            if changed_fields:
+                message.save(update_fields=changed_fields)
 
             self.logger.info(f"Email {message_id} updated in mailbox {mailbox}: {updates}")
 
@@ -2672,7 +3021,7 @@ class ReplyEmailTool(BaseTool):
                 "properties": {
                     "message_id": {
                         "type": "string",
-                        "description": "The Exchange message ID of the email to reply to"
+                        "description": "The message ID of the email to reply to in target_mailbox. For IMAP, also supply its folder when it is not inbox."
                     },
                     "body": {
                         "type": "string",
@@ -2686,14 +3035,17 @@ class ReplyEmailTool(BaseTool):
                     "attachments": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "File paths to attach to the reply (optional)"
+                        "description": "Exchange-only server-local file paths; use files on any supported provider."
                     },
+                    "files": FILES_SCHEMA,
                     **INLINE_ATTACHMENTS_SCHEMA,
                     **BODY_FORMAT_SCHEMA,
                     "target_mailbox": {
                         "type": "string",
                         "description": "Email address to reply from (requires impersonation/delegate access)"
-                    }
+                    },
+                    "dry_run": dry_run_schema("sending the reply"),
+                    "verify_files": VERIFY_FILES_SCHEMA,
                 },
                 "required": ["message_id", "body"]
             }
@@ -2707,6 +3059,8 @@ class ReplyEmailTool(BaseTool):
         reply_all = kwargs.get("reply_all", False)
         attachments = kwargs.get("attachments", [])
         target_mailbox = kwargs.get("target_mailbox")
+        dry_run = bool(kwargs.get("dry_run", False))
+        fetch_files = not dry_run or bool(kwargs.get("verify_files"))
 
         if not message_id:
             raise ToolExecutionError("message_id is required")
@@ -2722,6 +3076,12 @@ class ReplyEmailTool(BaseTool):
         try:
             # Get account (primary or impersonated)
             account = self.get_account(target_mailbox)
+            tracking_id = new_outbound_tracking_id()
+            file_entries = validate_outgoing_files(kwargs.get("files"))
+            outgoing_files = await load_outgoing_files(
+                file_entries,
+                storage_client=lambda: smartermail_client(self.ews_client, target_mailbox),
+            ) if fetch_files else []
             mailbox = self.get_mailbox_info(target_mailbox)
 
             # Find the original message across folders
@@ -2832,6 +3192,8 @@ class ReplyEmailTool(BaseTool):
             # Create a new Message with the complete body
             message = Message(
                 account=account,
+                author=Mailbox(email_address=account.primary_smtp_address),
+                outbound_tracking_id=tracking_id,
                 subject=reply_subject,
                 body=HTMLBody(complete_body),
                 to_recipients=reply_to_recipients
@@ -2870,7 +3232,7 @@ class ReplyEmailTool(BaseTool):
                             new_attachment_count += 1
                             self.logger.info(f"Attached file: {file_name} ({len(content)} bytes)")
                     except FileNotFoundError:
-                        raise ToolExecutionError(f"Attachment file not found: {file_path}")
+                        raise ToolExecutionError(f"Attachment file not found on the Email MCP server: {file_path}. {REMOTE_AGENT_POINTER}", hint=REMOTE_AGENT_HINT)
                     except PermissionError:
                         raise ToolExecutionError(f"Permission denied reading attachment: {file_path}")
                     except Exception as e:
@@ -2881,21 +3243,42 @@ class ReplyEmailTool(BaseTool):
             if inline_b64_count > 0:
                 new_attachment_count += inline_b64_count
                 self.logger.info(f"Added {inline_b64_count} inline (base64) attachment(s)")
+            new_attachment_count += attach_outgoing_files(message, outgoing_files)
 
-            # Send the message
-            message.send()
-            self.logger.info(f"Reply sent to {original_from_email} from mailbox: {mailbox}")
-
-            # Determine who the reply was sent to
-            reply_to_list = []
+            # Determine who the reply goes to
             if reply_all:
                 reply_to_list = [original_from_email] + [e for e in original_to + original_cc
                                                         if e != account.primary_smtp_address]
             else:
                 reply_to_list = [original_from_email]
 
+            if dry_run:
+                # Everything above only read the original; nothing is sent
+                # and no draft is saved.
+                return format_success_response(
+                    "Dry run - no reply sent",
+                    dry_run=True,
+                    sent=False,
+                    message_checked=True,
+                    would_send_to=reply_to_list,
+                    subject=reply_subject,
+                    original_subject=original_subject,
+                    reply_all=reply_all,
+                    attachments_count=new_attachment_count,
+                    would_attach=new_attachment_count + (0 if fetch_files else len(file_entries)),
+                    inline_attachments_preserved=inline_count,
+                    mailbox=mailbox,
+                    **dry_run_file_report(file_entries, outgoing_files if fetch_files else None),
+                )
+
+            # Send the message
+            message.send()
+            self.logger.info(f"Reply sent to {original_from_email} from mailbox: {mailbox}")
             return format_success_response(
-                "Reply sent successfully",
+                "Reply accepted by mail server; final delivery not yet confirmed",
+                tracking_id=tracking_id,
+                accepted_by_mail_server=True,
+                delivery_confirmed=False,
                 original_subject=original_subject,
                 reply_to=reply_to_list,
                 reply_all=reply_all,
@@ -2904,7 +3287,7 @@ class ReplyEmailTool(BaseTool):
                 mailbox=mailbox
             )
 
-        except ToolExecutionError:
+        except (ValidationError, ToolExecutionError):
             raise
         except Exception as e:
             self.logger.error(f"Failed to send reply: {e}")
@@ -2917,13 +3300,17 @@ class ForwardEmailTool(BaseTool):
     def get_schema(self) -> Dict[str, Any]:
         return {
             "name": "forward_email",
-            "description": "Forward an email to new recipients with original content and attachments.",
+            "description": (
+                "Forward an email with its original content and attachments, "
+                "optionally adding files from a URL, base64 content, server-local path, "
+                "or SmarterMail personal file storage."
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "message_id": {
                         "type": "string",
-                        "description": "The Exchange message ID of the email to forward"
+                        "description": "The message ID of the email to forward"
                     },
                     "to": {
                         "type": "array",
@@ -2947,14 +3334,17 @@ class ForwardEmailTool(BaseTool):
                     "attachments": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Additional file paths to attach (optional)"
+                        "description": "Exchange-only server-local file paths; use files on any supported provider."
                     },
+                    "files": FILES_SCHEMA,
                     **INLINE_ATTACHMENTS_SCHEMA,
                     **BODY_FORMAT_SCHEMA,
                     "target_mailbox": {
                         "type": "string",
                         "description": "Email address to forward from (requires impersonation/delegate access)"
-                    }
+                    },
+                    "dry_run": dry_run_schema("sending the forward"),
+                    "verify_files": VERIFY_FILES_SCHEMA,
                 },
                 "required": ["message_id", "to"]
             }
@@ -2970,6 +3360,8 @@ class ForwardEmailTool(BaseTool):
         bcc_recipients = kwargs.get("bcc", [])
         additional_attachments = kwargs.get("attachments", [])
         target_mailbox = kwargs.get("target_mailbox")
+        dry_run = bool(kwargs.get("dry_run", False))
+        fetch_files = not dry_run or bool(kwargs.get("verify_files"))
 
         if not message_id:
             raise ToolExecutionError("message_id is required")
@@ -2985,7 +3377,13 @@ class ForwardEmailTool(BaseTool):
         try:
             # Get account (primary or impersonated)
             account = self.get_account(target_mailbox)
+            tracking_id = new_outbound_tracking_id()
             mailbox = self.get_mailbox_info(target_mailbox)
+            file_entries = validate_outgoing_files(kwargs.get("files"))
+            outgoing_files = await load_outgoing_files(
+                file_entries,
+                storage_client=lambda: smartermail_client(self.ews_client, target_mailbox),
+            ) if fetch_files else []
 
             # Find the original message across folders
             original_message = find_message_for_account(account, message_id)
@@ -3057,6 +3455,8 @@ class ForwardEmailTool(BaseTool):
             # Create a new Message with the complete body
             message = Message(
                 account=account,
+                author=Mailbox(email_address=account.primary_smtp_address),
+                outbound_tracking_id=tracking_id,
                 subject=forward_subject,
                 body=HTMLBody(complete_body),
                 to_recipients=[Mailbox(email_address=email) for email in to_recipients]
@@ -3101,7 +3501,7 @@ class ForwardEmailTool(BaseTool):
                             additional_attachment_count += 1
                             self.logger.info(f"Attached additional file: {file_name} ({len(content)} bytes)")
                     except FileNotFoundError:
-                        raise ToolExecutionError(f"Attachment file not found: {file_path}")
+                        raise ToolExecutionError(f"Attachment file not found on the Email MCP server: {file_path}. {REMOTE_AGENT_POINTER}", hint=REMOTE_AGENT_HINT)
                     except PermissionError:
                         raise ToolExecutionError(f"Permission denied reading attachment: {file_path}")
                     except Exception as e:
@@ -3112,13 +3512,35 @@ class ForwardEmailTool(BaseTool):
             if inline_b64_count > 0:
                 additional_attachment_count += inline_b64_count
                 self.logger.info(f"Added {inline_b64_count} inline (base64) attachment(s)")
+            additional_attachment_count += attach_outgoing_files(message, outgoing_files)
+
+            if dry_run:
+                return format_success_response(
+                    "Dry run - no forward sent",
+                    dry_run=True,
+                    sent=False,
+                    message_checked=True,
+                    would_send_to=to_recipients,
+                    would_cc=cc_recipients or [],
+                    would_bcc=bcc_recipients or [],
+                    subject=forward_subject,
+                    original_subject=original_subject,
+                    attachments_included=total_original_attachments,
+                    attachments_count=additional_attachment_count,
+                    would_attach=additional_attachment_count + (0 if fetch_files else len(file_entries)),
+                    mailbox=mailbox,
+                    **dry_run_file_report(file_entries, outgoing_files if fetch_files else None),
+                )
 
             # Send the message
             message.send()
             self.logger.info(f"Email forwarded to {', '.join(to_recipients)} from mailbox: {mailbox}")
 
             return format_success_response(
-                "Email forwarded successfully",
+                "Forward accepted by mail server; final delivery not yet confirmed",
+                tracking_id=tracking_id,
+                accepted_by_mail_server=True,
+                delivery_confirmed=False,
                 original_subject=original_subject,
                 forwarded_to=to_recipients,
                 cc=cc_recipients if cc_recipients else None,
@@ -3129,7 +3551,7 @@ class ForwardEmailTool(BaseTool):
                 mailbox=mailbox
             )
 
-        except ToolExecutionError:
+        except (ValidationError, ToolExecutionError):
             raise
         except Exception as e:
             self.logger.error(f"Failed to forward email: {e}")

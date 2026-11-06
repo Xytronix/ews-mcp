@@ -11,6 +11,30 @@ from ..exceptions import ToolExecutionError
 from ..utils import format_success_response, safe_get, parse_datetime_tz_aware, parse_date_tz_aware, ews_id_to_str
 
 
+# ``account.tasks.get(id=...)`` asks EWS for every Task field, including
+# ``mime_content``. SmarterMail answers that with
+# ErrorUnsupportedMimeConversion ("MIME content not supported for this item
+# type"), which broke update_task / complete_task / delete_task outright.
+# Fetch by id with an explicit field list instead. (EWS cannot filter on
+# ``id``, so this goes through Account.fetch with an (id, changekey) pair.)
+TASK_FETCH_FIELDS = (
+    "subject", "body", "categories", "due_date", "start_date",
+    "percent_complete", "importance", "status", "reminder_is_set",
+    "reminder_due_by",
+)
+
+
+def get_task_by_id(account, item_id):
+    """Fetch one task by id without requesting its MIME content."""
+    results = list(account.fetch(ids=[(item_id, None)], only_fields=TASK_FETCH_FIELDS))
+    if not results:
+        raise ToolExecutionError(f"Task not found: {item_id}")
+    task = results[0]
+    if isinstance(task, Exception):
+        raise ToolExecutionError(f"Task not found: {item_id}: {task}")
+    return task
+
+
 class CreateTaskTool(BaseTool):
     """Tool for creating tasks."""
 
@@ -169,7 +193,12 @@ class GetTasksTool(BaseTool):
             if not include_completed:
                 items = items.filter(is_complete=False)
 
-            items = items.order_by('-datetime_created')
+            # Same MIME trap as the fetch-by-id path: without .only(), EWS is
+            # asked for mime_content and SmarterMail fails the whole query.
+            items = items.order_by('-datetime_created').only(
+                "subject", "status", "percent_complete", "is_complete",
+                "due_date", "importance", "datetime_created",
+            )
 
             # Format tasks. Wrap each item so one malformed task cannot
             # sink the entire response — previously a single bad
@@ -293,18 +322,24 @@ class UpdateTaskTool(BaseTool):
             mailbox = self.get_mailbox_info(target_mailbox)
 
             # Get the task
-            task = account.tasks.get(id=item_id)
+            task = get_task_by_id(account, item_id)
 
-            # Update fields
+            # Track the touched fields: a bare save() asks EWS to update every
+            # writable Task field, including ones this call never loaded.
+            changed_fields = []
+
             if "subject" in kwargs:
                 task.subject = kwargs["subject"]
+                changed_fields.append("subject")
 
             if "body" in kwargs:
                 task.body = kwargs["body"]
+                changed_fields.append("body")
 
             # Issue #114
             if "categories" in kwargs:
                 task.categories = list(kwargs["categories"] or [])
+                changed_fields.append("categories")
 
             if "due_date" in kwargs:
                 # Convert string to EWSDate for date-only field
@@ -314,15 +349,19 @@ class UpdateTaskTool(BaseTool):
                 else:
                     # If it's already a datetime object from somewhere else
                     task.due_date = parse_date_tz_aware(due_date_str.isoformat())
+                changed_fields.append("due_date")
 
             if "percent_complete" in kwargs:
                 task.percent_complete = Decimal(str(kwargs["percent_complete"]))
+                changed_fields.append("percent_complete")
 
             if "importance" in kwargs:
                 task.importance = kwargs["importance"]
+                changed_fields.append("importance")
 
             # Save changes
-            task.save()
+            if changed_fields:
+                task.save(update_fields=changed_fields)
 
             self.logger.info(f"Updated task {item_id}")
 
@@ -370,11 +409,11 @@ class CompleteTaskTool(BaseTool):
             mailbox = self.get_mailbox_info(target_mailbox)
 
             # Get and complete the task
-            task = account.tasks.get(id=item_id)
+            task = get_task_by_id(account, item_id)
             task.percent_complete = Decimal('100')
             task.status = "Completed"
-            task.is_complete = True
-            task.save()
+            # is_complete is read-only in EWS; status/percent_complete drive it.
+            task.save(update_fields=["percent_complete", "status"])
 
             self.logger.info(f"Completed task {item_id}")
 
@@ -422,7 +461,7 @@ class DeleteTaskTool(BaseTool):
             mailbox = self.get_mailbox_info(target_mailbox)
 
             # Get and delete the task
-            task = account.tasks.get(id=item_id)
+            task = get_task_by_id(account, item_id)
             task.delete()
 
             self.logger.info(f"Deleted task {item_id}")

@@ -1,5 +1,145 @@
 # Changelog
 
+## Fork additions (4.0 line, `src/`)
+
+This fork of [azizmazrou/ews-mcp](https://github.com/azizmazrou/ews-mcp)
+extends the 4.0 server in `src/`. The 4.5 server in `v5/` is unchanged.
+Upstream's history follows from `[Unreleased]` on.
+
+### Added
+
+- Microsoft Graph mailbox backend for Outlook.com and Microsoft 365, with a
+  delegated refresh token or app-only client credentials. Mail, drafts,
+  attachments, calendar and contacts route through it.
+- IMAP/SMTP mailbox backend with iCloud and Gmail presets and generic server
+  settings. iCloud calendars and contacts use CalDAV/CardDAV with the
+  app-specific password.
+- Multi-mailbox accounts from `MAIL_ACCOUNTS`, the `ICLOUD_*`, `GMAIL_*` and
+  `OUTLOOK_*` variables, or a Supabase table (`SUPABASE_URL`,
+  `SUPABASE_SERVICE_KEY`, `EWS_ACCOUNTS_TABLE`). Exchange rows in the table
+  give extra mailboxes their own passwords.
+- Provider-routed tools. The existing mail, draft, attachment, calendar and
+  contact tool names route by `target_mailbox` (alias `mailbox`), and
+  `list_mailboxes` reports each account with its capabilities.
+- Unified drafts. `create_draft`, `create_reply_draft`,
+  `create_forward_draft` and `update_draft` work on Exchange, Graph and IMAP,
+  and `send_email(draft_id=...)` sends a saved draft unchanged.
+- Canonical `files` attachment input on the send, reply, forward and draft
+  tools. Sources are `file_path`, base64 `file_content`, `file_url`
+  (SSRF-guarded server fetch, 25 MiB) and `storage_file_id` (SmarterMail file
+  storage). The attachment tools also route to Graph and IMAP.
+- `stage_outgoing_file` and `delete_staged_file`, and an optional
+  `POST /stage` raw upload endpoint on streamable-http that
+  `STAGE_UPLOAD_TOKEN` enables.
+- `dry_run` on `reply_email` and `forward_email`, and `verify_files` on all
+  three send tools.
+- Liteparse attachment parsing with OCR for PDF, Office, OpenDocument and
+  image files, and text extraction for archives (zip, 7z, rar, tar), calendar
+  and vCard files, MSG, EML, RTF, certificates, signatures and data formats.
+  Password-protected archives and PDFs take a `password`, and the server
+  tries passwords found in the message body.
+- 39 SmarterMail REST tools in mail, settings, calendar and contacts,
+  workspace and domain-admin groups, including native scheduled send.
+- Native streamable-HTTP transport (`MCP_TRANSPORT=streamable-http`) at
+  `/mcp` with `/health`, and `MCP_ALLOW_UNAUTHENTICATED` for a private docker
+  network.
+- Tool-call pacing. A call waits up to `RATE_LIMIT_MAX_WAIT_SECONDS` (60) for
+  a rate-limit slot instead of failing.
+- EWS throttle backoff. `search_emails` runs one search at a time per process
+  and retries `ErrorServerBusy` and HTTP 429 with exponential backoff
+  (`EWS_THROTTLE_MAX_RETRIES`, `EWS_THROTTLE_BASE_DELAY`,
+  `EWS_THROTTLE_MAX_DELAY`).
+- A test suite in `tests/`.
+
+### Changed
+
+- SmarterMail REST tools are opt-in. `SMARTERMAIL_ENABLED` defaults to
+  false, and `SMARTERMAIL_ADMIN_TOOLS=true` adds the 8 domain-admin tools.
+  `SMARTERMAIL_BASE_URL` defaults to the host of `EWS_SERVER_URL`.
+- Outbound messages set the From header and carry an
+  `X-EWS-MCP-Tracking-ID` header with an `ews-mcp-` ID. Send, reply and
+  forward report `accepted_by_mail_server`, `delivery_confirmed: false` and
+  `tracking_id` instead of claiming delivery.
+- The Docker image serves streamable-http on `0.0.0.0:8000`. It is a single
+  `python:3.12-slim` stage with LibreOffice, Tesseract, ImageMagick, libheif,
+  unar and openssl, and it runs `python -m src.main` as root without
+  `docker-entrypoint.sh`. The non-loopback bind guard now covers
+  streamable-http as well as sse.
+- `RATE_LIMIT_REQUESTS_PER_MINUTE` defaults to 120 instead of 25.
+- `get_email_details` defaults to `format=markdown`. On Exchange, `read_emails`
+  adds the full body only with `include_body=true` (html by default).
+  `read_attachment` returns 8000 characters per call by default. Base64
+  `download_attachment` and `get_email_mime` refuse more than 64 KiB unless
+  `max_bytes` is raised.
+- Liteparse replaces pdfplumber, python-docx, openpyxl and python-pptx.
+  `mcp` is pinned to 1.28.0.
+- For basic and NTLM auth, the primary mailbox password may come from its row
+  in the Supabase table instead of `EWS_PASSWORD`.
+- Startup no longer tests the Exchange connection. It opens on the first tool
+  call.
+- With `EWS_SERVER_URL` set, the EWS version is pinned to Exchange 2016
+  (15.1) instead of detected. The auth scheme is set from `EWS_AUTH_TYPE`.
+
+### Fixed
+
+- `create_appointment` and `update_appointment` send meeting invitations to
+  attendees and save a copy. `delete_appointment` also notifies
+  optional-only attendees. `respond_to_meeting` accepts an invitation ID
+  from the Inbox.
+- Tasks and contacts work on servers that reject MIME conversion
+  (`ErrorUnsupportedMimeConversion`). Lookups and listings request explicit
+  fields.
+- Folder rename updates only the name, and folder move reparents the folder.
+- Email, appointment, task and contact updates send only the changed fields.
+  `update_contact` keeps phone and email entries it was not given.
+- EWS attachments: strict base64 decoding (including data URLs), content type
+  from the file name, a Content-ID for inline files, embedded messages served
+  as `.eml`, fetch errors surfaced and case-insensitive name matching.
+- HTML-only messages: bodies fall back to text derived from the HTML, missing
+  dates no longer crash `get_email_details`, and HTML-to-markdown drops
+  `head`, `style`, `script` and layout tables.
+- Subject search results are verified locally, and a failed scan reports
+  `total_available: null` instead of a partial count.
+- Graph attachment listing no longer selects `contentId`, and
+  `has_attachments` search works together with ordering.
+- Routed tools no longer crash on duplicate response keys after the provider
+  accepted the action.
+- 7z extraction works with py7zr 1.x (requirement raised to 1.1.3).
+
+### Remote-agent attachments (2026-09-24)
+
+- New `stage_outgoing_file` / `delete_staged_file`: store base64, a URL (SSRF-guarded, 25 MiB) or a server file under `EWS_MCP_STAGING_DIR` with a TTL (default 1 h, max 24 h) and get a container-local `file_path` for `files`. Bare file names only; expired entries are purged lazily and refused.
+- `reply_email` and `forward_email` gain `dry_run`; all three send tools gain `verify_files` to load every file during a dry run. Previews report `would_attach`, `files_validated`, `files_fetched`.
+- Attachment inputs accept aliases (`filename`, `content`/`base64`/`data`, `path`/`filepath`, `url`) in one normalisation step shared by `files` and `add_attachment`.
+- Missing server paths fail with a `ValidationError` naming the remote-friendly sources; error responses carry an untruncated `hint`. Tool logs now redact base64 inside `files` lists and aliases.
+
+### iCloud CalDAV/CardDAV (2026-09-17)
+
+- Route iCloud calendar and contact CRUD through the existing provider-unified tool names using CalDAV/CardDAV discovery and the iCloud app-specific password.
+- Return DAV resource hrefs, VEVENT/VCARD UIDs and ETags for calendar/contact identities; IMAP UIDs remain mail-only.
+- Document unsupported extras honestly: organization free/busy, meeting-time search, attendee-response delivery semantics, GAL/history/domain search and contact analytics are not available on DAV.
+
+### Graph calendar/contacts and native scheduling (2026-09-16)
+
+- Route calendar CRUD, invitations, organizational availability, contact CRUD and personal-contact lookup through the existing tools on Graph. Extra consent and explicit `graph_scope` configuration are required; unsupported personal-account free/busy and directory/history analytics fail honestly.
+- Schedule saved SmarterMail drafts and canonical `files` in one call, preserving existing attachments and inline content through verified native identities.
+- Verify the whole Scheduled queue using native pagination. Cancel/undo distinguish requested action and observed queue removal from unconfirmed delivery prevention; neither claims recall.
+- Describe meeting-time suggestions as deterministic availability scoring, including conservative unknown-data handling and DST-safe Graph slot calculations.
+- Document CalDAV/CardDAV as separate, unimplemented protocols rather than IMAP capabilities.
+
+### Unified drafts (2026-09-16)
+
+- Expose compose, reply and forward draft creation plus partial `update_draft` through the same tool names on Exchange, Graph and IMAP.
+- Preserve omitted fields, recipients and attachments; return fresh IMAP draft and attachment identities.
+- Retain recoverable draft IDs on multi-step failures, with optional cleanup of newly-created drafts. Uncertain Graph submissions are not retried or cleaned up automatically.
+- Make `files` canonical; keep deprecated Exchange attachment inputs working. Advertise configured per-mailbox capabilities and consent/service requirements.
+
+### IMAP/SMTP safety (2026-09-16)
+
+- Serialize complete IMAP mailbox operations; use UID EXPUNGE only, never folder-wide EXPUNGE.
+- Resolve rewritten draft UIDs before retiring originals; return current mailbox/folder-bound IDs and fresh attachment part IDs.
+- Report partial SMTP refusal as `sent: false`, with accepted/refused recipients. Sent-copy failures do not imply submission failed; never retry accepted recipients blindly.
+
 ## [Unreleased]
 
 ### Documentation

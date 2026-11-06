@@ -1,12 +1,12 @@
 version: '3.8'
 
-# EWS MCP - Person-Centric Exchange Server
-# Build from source for development/testing.
+# EWS MCP (fork). Builds the image from source.
 #
-# SSE transport reminder: MCP_HOST defaults to 127.0.0.1. If you set
-# MCP_TRANSPORT=sse and want the port reachable outside the container,
-# set MCP_HOST=0.0.0.0 AND MCP_API_KEY=<secret> in your .env. The server
-# refuses to bind a non-loopback address without an API key.
+# The image serves streamable-http on 0.0.0.0:8000 (MCP endpoint /mcp,
+# health /health). With network_mode: host that port is open on the host,
+# so .env must set MCP_API_KEY. The server refuses a non-loopback bind
+# without it unless MCP_ALLOW_UNAUTHENTICATED=true, which is only meant for
+# a private docker network whose port is never published.
 
 services:
   ews-mcp-server:

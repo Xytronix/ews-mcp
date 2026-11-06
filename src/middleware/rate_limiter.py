@@ -51,6 +51,35 @@ class RateLimiter:
                 f"Rate limit exceeded: maximum {self.requests_per_minute} requests per minute"
             )
 
+    def seconds_until_slot(self) -> float:
+        """Seconds until the oldest request leaves the window (0 if free)."""
+        now = time()
+        with self._lock:
+            while self.requests and self.requests[0] < now - self.window_seconds:
+                self.requests.popleft()
+            if len(self.requests) < self.requests_per_minute:
+                return 0.0
+            return max(0.05, self.requests[0] + self.window_seconds - now)
+
+    async def acquire(self, max_wait: float = 60.0, sleep=None) -> None:
+        """Wait (backoff) for a slot instead of failing; raise after max_wait.
+
+        Bursty callers (e.g. one search per mailbox across 10 mailboxes)
+        are paced to the configured rate rather than erroring out.
+        """
+        import asyncio
+        sleep = sleep or asyncio.sleep
+        waited = 0.0
+        while not self.is_allowed():
+            delay = self.seconds_until_slot()
+            if waited + delay > max_wait:
+                raise RateLimitError(
+                    f"Rate limit exceeded: maximum {self.requests_per_minute} "
+                    f"requests per minute (waited {waited:.0f}s)"
+                )
+            await sleep(delay)
+            waited += delay
+
     def get_remaining(self) -> int:
         """Get remaining requests in current window."""
         now = time()

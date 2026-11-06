@@ -1,7 +1,8 @@
-> **Legacy 4.0 documentation** — this page describes the `src/` server
-> that ships as `ghcr.io/azizmazrou/ews-mcp:latest`. For the current
-> 4.5 line see [`v5/README.md`](../../v5/README.md) and
-> [`v5/docs/API.md`](../../v5/docs/API.md).
+> **Legacy 4.0 documentation.** This page describes the `src/` server as
+> extended by this fork. Upstream's `ghcr.io/azizmazrou/ews-mcp:latest` image
+> does not include the fork's additions, and the fork publishes no image (see
+> the [README](../../README.md#quick-start)). For upstream's 4.5 line see
+> [`v5/README.md`](../../v5/README.md) and [`v5/docs/API.md`](../../v5/docs/API.md).
 
 # Agent Secretary Guide
 
@@ -179,13 +180,94 @@ execute_approved_action { "approval_id": "8a…" }
 // → actually sends the mail; approval record consumed.
 ```
 
-### Dry-run flag on `send_email`
+### Dry-run flag on `send_email` / `reply_email` / `forward_email`
 
-`send_email` accepts `dry_run: true`; it validates, builds the
-`Message` object, and returns a preview without calling
-`message.send()`. Useful for AI agents that want "what would this send"
-before committing. The Drafts folder is *not* touched either — that's
-what `create_draft` is for.
+`dry_run=true` previews without sending or modifying a message. In compose
+mode it creates no draft and validates `files` entries without fetching their
+content (`files_validated: true`, `files_fetched: false`, `would_attach`);
+add `verify_files=true` to load every file and get name/size/content_type per
+entry. Deprecated Exchange `attachments` paths are still read. Exchange
+`reply_email`/`forward_email` previews also read the original message and
+return `would_send_to`. With `send_email(draft_id=…)`, it authenticates and
+reads the existing draft, returning stored recipients, subject and a body
+preview without sending, editing or deleting it. Invalid, missing or
+unreadable drafts can therefore fail during preview. Attachment counts in the
+preview vary by provider.
+
+### Attaching files from a remote agent
+
+The agent box and the Email container share no filesystem: never pass a
+`/workspace/...` path. Either send the bytes inline —
+`files=[{"file_content": b64, "file_name": "photo.jpg"}]` — or call
+`stage_outgoing_file(file_content=b64, file_name="photo.jpg")` once and reuse
+the returned `file_path` in `files` for the dry run and the real send. Aliases
+such as `filename`, `content`, `base64`, `data` and `url` are accepted.
+
+### Reviewable drafts across providers
+
+Use `list_mailboxes` to select an account and check its capabilities; one
+mailbox's calendar, contacts or scheduling access does not imply another's.
+`create_draft`, `create_reply_draft`, `create_forward_draft` and `update_draft`
+work on Exchange, Graph and IMAP with the same public tool names.
+
+Use canonical `files` when creating a draft: remote agents use base64
+`file_content`, `file_url`, or a `stage_outgoing_file` path (see above);
+`file_path` only names files on the Email server. Legacy
+`attachments`/`inline_attachments` remain supported only on their existing
+Exchange paths and are deprecated.
+
+Keep the returned current `id`/`message_id`, `mailbox`, `folder` and attachment
+IDs together. `update_draft` changes only supplied `subject`/`body`:
+omission preserves, `""` clears (explicit null is rejected); `body_format`
+defaults to `markdown`.
+Recipients and attachments remain unchanged. IMAP rewrites yield new message
+and attachment part IDs, so never continue with an old ID after an edit.
+
+After review, call `send_email(draft_id=…, target_mailbox=…, folder="drafts")`
+with no compose overrides. An approval to send a draft is not a frozen-content
+snapshot: avoid intervening edits and obtain renewed review if content changes.
+Do not assume draft creators/editors are approval-queue allow-listed merely
+because they are public tools.
+
+Graph multi-step failures retain new drafts by default and return a recovery
+`draft_id`, `folder`, `stage`, cleanup information and submission uncertainty
+when available. IMAP draft creators also honor `cleanup_on_failure` if
+metadata/relisting fails after creation and the new ID is known. The option
+defaults to false and only applies to a draft created by that call, never a
+caller's existing draft; Graph skips cleanup when submission is uncertain.
+Inspect a retained
+partial draft before resuming. Accepted SMTP recipients are not confirmed
+deliveries: inspect `accepted_recipients`, `refused_recipients` and
+`partial_failure`; do not resend to accepted recipients or blindly retry an
+uncertain submission. See [draft recovery](API.md#draft-recovery).
+
+Core calendar/contact operations support Exchange, Graph and iCloud/DAV. Graph
+requires calendar/contact consent. Its default delegated refresh scope already
+requests `Calendars.ReadWrite` and `Contacts.ReadWrite`, and a custom
+per-account `settings.graph_scope` must include them (see [API](API.md#calendar)).
+Graph free/busy and meeting suggestions require an organization account.
+iCloud CalDAV/CardDAV uses the app-specific password and supports event/contact
+CRUD behind the same tools, but not organization free/busy, meeting-time search,
+GAL/history/domain lookup or communication statistics. `find_person` is
+contacts-only on Graph/DAV (default `all` reports partial coverage).
+Tasks and `analyze_contacts` remain Exchange-only. Scheduling/undo require
+SmarterMail REST.
+
+For SmarterMail, `schedule_email(draft_id=…, send_at=…, files=[…])`
+schedules a reviewed saved Exchange draft without compose overrides; use
+`update_draft` before scheduling if content must change. Files append, stored
+attachments/CIDs remain, and native scheduling consumes the source into
+Scheduled. Track the returned numeric Scheduled `uid` separately from the
+source EWS `draft_id`; use it with `cancel_scheduled_email`.
+
+On failure inspect `stage`, `submission_uncertain` and `recovery_hint`, then
+check both Drafts and Scheduled before retrying. Appended files can persist,
+and uncertain submission may already have consumed the source. A successful
+queue operation is not delivery. Removal reports `removed_from_queue:true`,
+not confirmed prevention: `cancelled:null`, `cancellation_confirmed:false`,
+`delivery_prevented:null`. An absent UID or native undo acknowledgment cannot
+prove delivery stopped. Do not tell the user a message was recalled or
+definitively cancelled based on these responses.
 
 ## Voice profile
 

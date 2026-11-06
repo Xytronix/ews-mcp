@@ -1,5 +1,8 @@
 # Core dependencies
-mcp>=1.0.0
+# Pinned: mcp 2.x rewrote the low-level Server API (no @Server.list_tools()),
+# so an unpinned rebuild boots into "'Server' object has no attribute
+# 'list_tools'". src/main.py targets the 1.x low-level server.
+mcp==1.28.0
 exchangelib==5.0.3
 pydantic>=2.8.0
 pydantic-settings>=2.5.2
@@ -26,11 +29,22 @@ structlog==24.1.0
 httpx>=0.25.0  # For AI API requests
 
 # File reading (for attachment content extraction)
-pdfplumber>=0.10.0    # PDF file reading with tables and images
-python-docx>=1.0.0    # Word document reading (DOCX)
-openpyxl>=3.1.0       # Excel file reading (XLSX)
-python-pptx>=0.6.21   # PowerPoint file reading (PPTX)
+liteparse>=2.1.0      # PDF/Office/image parsing with OCR (replaces pdfplumber/docx/xlsx/pptx stack)
 extract-msg>=0.50.0   # Outlook MSG compound-file (.msg) attachment reader
+icalendar>=6.0.0      # ICS/VCS calendar invite parsing
+striprtf>=0.0.26      # RTF text extraction
+vobject>=0.9.9        # vCard (.vcf) parsing
+py7zr>=1.1.3          # 7z archive extraction (1.0 dropped read/readall for the
+                      # extract(factory=) API; 1.1.3 fixes the bomb/CPU CVEs)
+PyYAML>=6.0.0         # YAML attachment decoding
+pillow>=10.0.0        # Image handling
+pillow-heif>=0.18.0   # HEIC/HEIF → JPEG for Liteparse
+cryptography>=42.0.0  # X.509 certs + PKCS#7 signatures
+pyarrow>=15.0.0       # Parquet preview
+fastavro>=1.9.0       # Avro preview
+olefile>=0.47         # OneNote / OLE sniffing
+rarfile>=4.2          # RAR archive extraction (needs unar/unrar in image)
+ezdxf>=1.4.0          # DXF text/layer extraction; DWG header + best-effort read
 
 # v4.0 — bidirectional body format
 markdownify>=0.13.1   # HTML -> Markdown for read direction (12x token reduction)

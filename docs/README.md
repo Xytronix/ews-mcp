@@ -3,6 +3,24 @@
 Two server lines live in this repository — make sure you read the docs
 for the one you run.
 
+## This fork's additions (4.0 line, `src/`)
+
+This fork extends the legacy 4.0 server in `src/` with Graph, IMAP/SMTP and
+iCloud CalDAV/CardDAV backends, multi-mailbox accounts, opt-in SmarterMail
+REST tools, Liteparse attachment parsing, remote attachment sources and
+staging, and native streamable HTTP. It publishes no container image, and
+upstream's `:latest` image does not include these additions. The 4.5 line in
+`v5/` is unchanged.
+
+| Document | What it covers |
+|---|---|
+| [Root README, configuration](../README.md#configuration) | Build and run, every fork-added environment variable with its default, mailbox accounts, the tool surface and provider limits |
+| [`legacy/API.md`](legacy/API.md#conventions) | Provider scope per mailbox, drafts and draft recovery, attachment sources and remote-agent flows, the SmarterMail scheduling tools |
+| [`legacy/TROUBLESHOOTING.md`](legacy/TROUBLESHOOTING.md) | Provider, attachment, draft recovery, SMTP acceptance and scheduling problems |
+| [`legacy/REPLY_FORWARD.md`](legacy/REPLY_FORWARD.md) | Reply and forward behaviour on Exchange, Graph and IMAP |
+| [`legacy/AGENT_SECRETARY.md`](legacy/AGENT_SECRETARY.md) | Dry runs, remote attachments and reviewable drafts across providers |
+| [`../CHANGELOG.md`](../CHANGELOG.md) | Every fork change |
+
 ## Current line — 4.5 (`v5/`, images `ghcr.io/…:v4.5*`)
 
 | Document | What it covers |

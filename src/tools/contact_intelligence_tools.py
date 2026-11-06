@@ -197,7 +197,12 @@ class FindPersonTool(BaseTool):
             account = self.get_account(target_mailbox)
             mailbox = self.get_mailbox_info(target_mailbox)
 
-            items = account.contacts.all()[:max_results]
+            # .only() keeps EWS from being asked for mime_content, which
+            # SmarterMail refuses for contacts.
+            items = account.contacts.all().only(
+                "display_name", "given_name", "surname", "email_addresses",
+                "company_name", "job_title",
+            )[:max_results]
 
             contacts = []
             for item in items:

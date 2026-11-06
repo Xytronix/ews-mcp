@@ -51,7 +51,7 @@ class AuthHandler:
         try:
             return Credentials(
                 username=self.config.ews_username,
-                password=self.config.ews_password
+                password=self.config.get_primary_password()
             )
         except Exception as e:
             self.logger.error(f"Basic auth setup failed: {e}")
@@ -62,7 +62,7 @@ class AuthHandler:
         try:
             return Credentials(
                 username=self.config.ews_username,
-                password=self.config.ews_password
+                password=self.config.get_primary_password()
             )
         except Exception as e:
             self.logger.error(f"NTLM auth setup failed: {e}")
