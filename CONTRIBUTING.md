@@ -1,103 +1,40 @@
-# Contributing to ews-mcp
+# Contributing
 
-Thanks for your interest in this project. Here's how it's organised
-and how to engage with it productively.
-
-## Repository layout
+## Layout
 
 ```
-v5/                      the 4.5 server (current line)
-src/                     legacy 4.0 source (ships as :latest)
-docs/                    documentation map; docs/legacy/ = 4.0 docs
-.github/workflows/       CI: docker-publish.yml + docker-build-test.yml
-Dockerfile               container build
-docker-compose.yml       reference docker-compose for local dev
-requirements.txt         runtime Python deps
-setup.py                 distribution metadata
-README.md                product landing page
-CHANGELOG.md             version history
+src/            the server (python -m src.main)
+tests/          pytest suite
+docs/           tool reference, troubleshooting, impersonation
+v5/             a separate server with its own README and CI
+Dockerfile      container build
+.env.example    every setting with comments
 ```
 
-There is no `tests/` directory in this repository. Test development
-happens out-of-tree against the maintainer's live mailbox; the public
-repo intentionally ships only the production product. The CI workflows
-verify Dockerfile build + Python import correctness — that's the gate
-PRs need to pass.
+## Tests
 
-## Filing issues
-
-- **Bug reports**: please include the Exchange auth type (`oauth2` /
-  `basic` / `ntlm`), the exchangelib version, the relevant tool name,
-  and the verbatim error message + a redacted version of the input
-  arguments. **Do not paste real email addresses, internal hostnames,
-  or message bodies** — the maintainer will reproduce against their
-  own mailbox once the shape of the bug is clear.
-- **Feature requests**: describe the workflow first, the proposed API
-  second. The maintainer's bias is to keep the MCP doing deterministic
-  data work and push reasoning to the consuming agent — see the README
-  "MCP / skill boundary" section for context. Reasoning-shaped tools
-  ("classify this", "summarise that") are unlikely to be added because
-  the consuming LLM does them better in-prompt.
-
-## Submitting pull requests
-
-PRs are welcome but the maintainer's pattern is:
-
-1. **Read the issue / PR for the problem statement and approach**
-2. **Reproduce the bug against a real mailbox** (not against the PR's diff)
-3. **Apply a fix in the maintainer's own style** rather than merging the
-   PR directly
-
-This keeps the codebase consistent and avoids hidden assumptions in
-contributor changes. So **please don't be offended if a PR is closed
-without merge** — it usually means the bug was real and got fixed in
-a separate commit by the maintainer; the issue stays linked so you can
-verify the fix.
-
-If you'd rather your code merged verbatim, the bar is higher:
-- The PR must apply cleanly on top of `main`
-- The Dockerfile + import check (`docker-build-test.yml`) must pass
-- The change must not introduce a new external service dependency
-  (e.g. a vector database) without prior discussion in an issue
-- The change must not re-add LLM-reasoning tools removed in v4.0
-  (see CHANGELOG for the rationale)
-
-## Local development
+The suite needs the system packages from the image, so run it there:
 
 ```bash
-git clone https://github.com/<owner>/<repo>.git
-cd <repo>
-pip install -r requirements.txt
-cp .env.example .env  # edit with your credentials
-python -m src.main
+docker build -t ews-mcp .
+docker run --rm -v "$PWD:/app" -w /app --entrypoint sh ews-mcp \
+  -c "pip install -q pytest pytest-asyncio && python -m pytest tests -q"
 ```
 
-Or via Docker:
+## Pull requests
 
-```bash
-docker build -t ews-mcp:dev .
-docker run -i --rm --env-file .env ews-mcp:dev
-```
-
-## Code style
-
-- Plain Python, no specific formatter enforced. Match surrounding style.
-- Comments should explain *why*, not *what*.
-- Don't add docstrings that just restate the function name.
-- Avoid try/except that swallows failures silently — log and re-raise
-  with context.
-- Don't introduce a new dependency without justifying it in the PR
-  description. Pure-stdlib solutions are preferred for everything
-  except the document-extraction libraries already in `requirements.txt`.
+- Keep changes small and in the surrounding style.
+- Add a test for behaviour a user would notice, and make sure the whole suite
+  passes.
+- Use example.com addresses and placeholder credentials. Never commit real
+  mailboxes, hostnames or tokens.
+- Update the README or `docs/` when a setting or tool changes.
 
 ## Security
 
-If you find a vulnerability that affects production deployments
-(credential leak, RCE, AuthZ bypass, etc.), **please don't open a
-public issue**. Email the maintainer directly via the address in
-`setup.py` and they'll coordinate a fix.
+Report vulnerabilities privately through GitHub's security advisory form, not
+in a public issue.
 
 ## License
 
-By contributing you agree your contribution is licensed under the
-project's MIT license.
+Contributions are licensed under the project's MIT license.

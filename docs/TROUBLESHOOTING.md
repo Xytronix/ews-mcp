@@ -1,9 +1,3 @@
-> **Legacy 4.0 documentation.** This page describes the `src/` server as
-> extended by this fork. Upstream's `ghcr.io/azizmazrou/ews-mcp:latest` image
-> does not include the fork's additions, and the fork publishes no image (see
-> the [README](../../README.md#quick-start)). For upstream's 4.5 line see
-> [`v5/README.md`](../../v5/README.md) and [`v5/docs/API.md`](../../v5/docs/API.md).
-
 # Troubleshooting Guide
 
 Common issues and solutions for the EWS MCP Server.

@@ -16,9 +16,8 @@ on:
       - main
       - master
     tags:
-      # v3/v4.0 lines only — v4.5.* (the v5 package) is published by
-      # v5-publish.yml from v5/Dockerfile; this workflow must never
-      # build the legacy tree for a v5 tag.
+      # v3/v4.0 tags build src/. v4.5.* tags are published by
+      # v5-publish.yml from v5/Dockerfile, never by this workflow.
       - 'v3.*.*'
       - 'v4.0.*'
   pull_request:

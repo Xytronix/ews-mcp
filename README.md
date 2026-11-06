@@ -1,386 +1,261 @@
-# EWS MCP Server (fork)
+# EWS MCP Server
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-This repository is a fork of
-[azizmazrou/ews-mcp](https://github.com/azizmazrou/ews-mcp), a Model Context
-Protocol server that gives an LLM client typed access to a Microsoft Exchange
-mailbox over EWS. The fork extends upstream's 4.0 server in [`src/`](src/) and
-keeps its tool names. It adds:
+An MCP server that gives an LLM client typed access to mail, calendars and
+contacts. An Exchange mailbox (EWS) is the primary account. More mailboxes can
+be added over other protocols, and the same tools work on all of them.
 
-- **More mailbox backends behind the same tools.** Microsoft Graph serves
-  Outlook.com and Microsoft 365 mailboxes. IMAP/SMTP serves iCloud, Gmail
-  (app password or OAuth sign-in) and generic IMAP servers. JMAP serves
-  Fastmail, Stalwart and other JMAP servers. CalDAV/CardDAV serves iCloud
-  calendars and contacts, and those of IMAP and JMAP accounts that set DAV
-  URLs. Mail, draft and attachment tools route to every backend, and the core
-  calendar and contact tools route to Graph and DAV.
-- **Multi-mailbox accounts.** Accounts come from the `MAIL_ACCOUNTS`
-  environment variable, single-account convenience variables or a Supabase
-  table. `list_mailboxes` lists them with their capabilities, and
-  `target_mailbox` selects one per call.
-- **Opt-in SmarterMail REST tools.** 39 tools for scheduled send,
-  signatures, notes, recurring events, file storage and domain administration
-  on a SmarterMail server.
-- **Liteparse attachment parsing.** `read_attachment` extracts text from PDF,
-  Office, OpenDocument and image files (with OCR), and from archives, calendar
-  and contact files, Outlook MSG, EML and many other formats.
-- **Attachments from remote agents.** A client that shares no filesystem with
-  the server can send files as base64, as a URL the server fetches, as a
-  SmarterMail storage file, or stage them on the server first.
-- **Native streamable HTTP** at `/mcp`, which is the Docker image default.
-- **Tool-call pacing and EWS throttle backoff.** Calls wait for a rate-limit
-  slot instead of failing, and `search_emails` retries EWS throttling.
-
-The fork also fixes a set of EWS defects (meeting invitations, task and
-contact access, folder rename and move, attachment payloads, HTML-only
-messages) and reports outbound mail as accepted by the mail server rather than
-delivered. [CHANGELOG.md](CHANGELOG.md) lists every change.
-
-Upstream's 4.5 line in [`v5/`](v5/) is included unchanged. It is a separate
-server with its own tool surface, and none of the fork's changes apply to it.
-Its documentation is [`v5/README.md`](v5/README.md).
-
-The fork lives at https://github.com/Xytronix/ews-mcp. The `dev` branch
-carries the fork and is the default branch. `main` mirrors upstream.
+- **Backends:** Exchange and SmarterMail over EWS, Outlook.com and
+  Microsoft 365 over Microsoft Graph, iCloud, Gmail and any IMAP server over
+  IMAP/SMTP, Fastmail and Stalwart over JMAP. CalDAV/CardDAV serves calendars
+  and contacts for IMAP and JMAP accounts.
+- **Multiple mailboxes:** `list_mailboxes` lists every account with its
+  capabilities, and `target_mailbox` selects one per call.
+- **Attachments:** `read_attachment` extracts text from PDF, Office,
+  OpenDocument and image files (with OCR), archives, calendar and contact
+  files, MSG and EML. Remote clients send files as base64, a URL or a staged
+  upload.
+- **SmarterMail REST tools (optional):** scheduled send, signatures, notes,
+  recurring events, file storage and domain administration.
+- **Transports:** stdio, SSE and streamable HTTP at `/mcp`.
 
 ## Quick start
-
-The fork publishes no container image. Build it from source.
 
 ### Docker
 
 ```bash
 git clone https://github.com/Xytronix/ews-mcp.git
 cd ews-mcp
-cp .env.example .env        # fill in credentials and set MCP_API_KEY
+cp .env.example .env        # fill in credentials and MCP_API_KEY
 docker build -t ews-mcp .
 docker run -d --name ews-mcp --env-file .env -p 8000:8000 ews-mcp
 curl http://localhost:8000/health
 ```
 
-The image runs `python -m src.main` with `MCP_TRANSPORT=streamable-http`,
-`MCP_HOST=0.0.0.0` and `MCP_PORT=8000`. The MCP endpoint is `/mcp`, and
-`/health` answers without authentication. Because the bind is not loopback,
-the server refuses to start unless `MCP_API_KEY` is set. Clients send the key
-as `Authorization: Bearer <key>`, as `X-API-Key: <key>` or as
-`?api_key=<key>`. `MCP_ALLOW_UNAUTHENTICATED=true` starts the server without a
-key. Use it only when the port is reachable on a private docker network and is
-never published.
-
-Register the server with any client that speaks streamable HTTP, for example
-Claude Code:
+The image serves streamable HTTP on `0.0.0.0:8000`. `/health` needs no key.
+Every other request needs `MCP_API_KEY`, sent as `Authorization: Bearer <key>`,
+`X-API-Key: <key>` or `?api_key=<key>`. The server refuses to start on a
+non-loopback address without a key unless `MCP_ALLOW_UNAUTHENTICATED=true`,
+which is only safe on a private network with no published port.
 
 ```bash
 claude mcp add --transport http exchange http://localhost:8000/mcp \
-  --header "Authorization: Bearer <your MCP_API_KEY>"
+  --header "Authorization: Bearer <MCP_API_KEY>"
 ```
 
-`docker compose up -d` builds and runs the same image from
-[`docker-compose.yml`](docker-compose.yml). That file uses host networking, so
-the server listens on port 8000 of the host and `.env` needs `MCP_API_KEY`.
+`docker compose up -d` builds and runs the same image with host networking.
+The image includes LibreOffice, Tesseract, ImageMagick, libheif, unar and
+openssl for attachment parsing.
 
-The image installs LibreOffice (Writer, Calc, Impress), Tesseract, ImageMagick,
-libheif, unar and openssl for attachment parsing.
-
-### stdio from source
+### From source (stdio)
 
 ```bash
-git clone https://github.com/Xytronix/ews-mcp.git
-cd ews-mcp
-python3 -m venv .venv
-. .venv/bin/activate
+python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # fill in credentials
+cp .env.example .env
 python -m src.main
 ```
 
-Outside the image `MCP_TRANSPORT` defaults to `stdio`. Python 3.11 or newer is
-required, and the image uses 3.12. The server reads `.env` and resolves its
-default `data/` and `downloads/` directories relative to the working
-directory, so an MCP client should start it from the repository root:
+Python 3.11 or newer is required. Start the server from the repository root,
+because it reads `.env` and its `data/` and `downloads/` directories from the
+working directory:
 
 ```bash
 claude mcp add exchange -- sh -c 'cd /path/to/ews-mcp && exec .venv/bin/python -m src.main'
 ```
 
-Variables marked `env` in the [fork variable table](#fork-added-variables) are
-read from the process environment only. A `.env` file does not set them for
-`python -m src.main`, so export them or pass them in the client's `env` block.
-The Dockerfile installs system packages for attachment parsing (listed above).
-Install them too if you need those formats outside Docker.
-
 ## Configuration
 
-### Core Exchange settings
+[`.env.example`](.env.example) lists every setting with comments, including
+the feature toggles, cache and AI options not repeated here.
 
-The 4.0 server always starts from a primary Exchange mailbox, even when the
-other accounts use Graph or IMAP. The most important settings:
+The account variables (`MAIL_ACCOUNTS`, `ICLOUD_*`, `GMAIL_*`, `OUTLOOK_*`,
+`GRAPH_*`) and the variables marked *env* below are read from the process
+environment only. A `.env` file does not set them when running from source,
+so export them or pass them in the client's `env` block. Docker
+`--env-file` sets them.
+
+### Primary Exchange mailbox
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `EWS_EMAIL` | required | Primary mailbox address |
-| `EWS_SERVER_URL` | unset | EWS endpoint as a full URL or a host name |
+| `EWS_SERVER_URL` | unset | EWS endpoint as a URL or host name |
 | `EWS_AUTODISCOVER` | `true` | Use autodiscover when `EWS_SERVER_URL` is unset |
 | `EWS_AUTH_TYPE` | `oauth2` | `oauth2`, `basic` or `ntlm` |
 | `EWS_CLIENT_ID`, `EWS_CLIENT_SECRET`, `EWS_TENANT_ID` | unset | Required for `oauth2` |
-| `EWS_USERNAME`, `EWS_PASSWORD` | unset | Required for `basic` and `ntlm`. The password may come from the Supabase table instead |
-| `TIMEZONE` | `UTC` | IANA time zone name |
+| `EWS_USERNAME`, `EWS_PASSWORD` | unset | Required for `basic` and `ntlm`. The password can also come from the accounts table |
+| `EWS_VERSION` | `auto` | EWS schema version with `EWS_SERVER_URL`. `auto` detects it once per endpoint. Pin it with a product name (`2016`, `2019`, `2013_SP1`, `O365`) or a build number (`15.1.1779.4`) |
+| `TIMEZONE` | `UTC` | IANA time zone for dates and calendar events |
+
+For `oauth2` on Exchange Online, register an app in Microsoft Entra ID, add
+the application permission `full_access_as_app` of Office 365 Exchange
+Online, grant admin consent and create a client secret. Set
+`EWS_SERVER_URL=https://outlook.office365.com/EWS/Exchange.asmx`. Access to
+other Exchange mailboxes without their own password needs impersonation or
+delegate rights, see [`docs/IMPERSONATION.md`](docs/IMPERSONATION.md).
+
+### Server
+
+| Variable | Default | Meaning |
+|---|---|---|
 | `MCP_TRANSPORT` | `stdio` | `stdio`, `sse` or `streamable-http`. The image sets `streamable-http` |
 | `MCP_HOST`, `MCP_PORT` | `127.0.0.1`, `8000` | HTTP bind. The image sets `0.0.0.0` |
-| `MCP_API_KEY` | unset | Key for HTTP clients. Required for a non-loopback bind |
-
-[`docs/legacy/SETUP.md`](docs/legacy/SETUP.md) walks through Exchange
-authentication. [`.env.example`](.env.example) lists the remaining upstream
-settings (feature toggles, cache, AI, impersonation) and every fork variable.
-
-### Fork-added variables
-
-Source `settings` means the value is read from the environment or from `.env`.
-Source `env` means it is read from the process environment only.
-
-| Variable | Default | Source | Meaning |
-|---|---|---|---|
-| `MCP_TRANSPORT` | `stdio` | settings | The fork adds the `streamable-http` value |
-| `MCP_ALLOW_UNAUTHENTICATED` | `false` | settings | Allow a non-loopback `sse` or `streamable-http` bind without `MCP_API_KEY` |
-| `STAGE_UPLOAD_TOKEN` | unset | env | Enables `POST /stage` on streamable-http. Unset, the route returns 404 |
-| `MAIL_ACCOUNTS` | unset | env | JSON array of mailbox accounts, see [Mailbox accounts](#mailbox-accounts) |
-| `ICLOUD_EMAIL` | unset | env | Adds an iCloud mailbox (IMAP/SMTP and CalDAV/CardDAV) |
-| `ICLOUD_APP_PASSWORD` | unset | env | iCloud app-specific password. `ICLOUD_PASSWORD` is accepted as well |
-| `ICLOUD_LABEL` | unset | env | Display label for the iCloud mailbox |
-| `ICLOUD_CALDAV_URL` | `https://caldav.icloud.com/` | env | CalDAV discovery root |
-| `ICLOUD_CARDDAV_URL` | `https://contacts.icloud.com/` | env | CardDAV discovery root |
-| `GMAIL_EMAIL` | unset | env | Adds a Gmail mailbox over IMAP/SMTP. Skipped without `GMAIL_OAUTH_REFRESH_TOKEN` or `GMAIL_APP_PASSWORD` |
-| `GMAIL_OAUTH_CLIENT_ID`, `GMAIL_OAUTH_CLIENT_SECRET`, `GMAIL_OAUTH_REFRESH_TOKEN` | unset | env | OAuth sign-in (XOAUTH2) instead of an app password, see [Gmail OAuth sign-in](#gmail-oauth-sign-in). With both set, OAuth is used |
-| `GMAIL_OAUTH_TOKEN_URL` | `https://oauth2.googleapis.com/token` | env | Token endpoint for the refresh |
-| `GMAIL_APP_PASSWORD` | unset | env | Google app password. Spaces are removed |
-| `GMAIL_LABEL` | `Gmail` | env | Display label for the Gmail mailbox |
-| `OUTLOOK_EMAIL` | unset | env | Adds an Outlook.com or Microsoft 365 mailbox over Graph |
-| `OUTLOOK_CLIENT_ID` | unset | env | Entra app client ID. Required |
-| `OUTLOOK_REFRESH_TOKEN` | unset | env | Delegated refresh token. Requests go to `/me` |
-| `OUTLOOK_CLIENT_SECRET` | unset | env | Client secret. Without a refresh token the backend uses app-only client credentials and `/users/<email>` |
-| `OUTLOOK_TENANT_ID` | `common` | env | Tenant used in the token URL |
-| `OUTLOOK_GRAPH_SCOPE` | `offline_access` plus Graph `User.Read`, `Mail.ReadWrite`, `Mail.Send`, `Calendars.ReadWrite`, `Contacts.ReadWrite` | env | Scope sent on delegated token refresh. App-only uses `https://graph.microsoft.com/.default` |
-| `OUTLOOK_LABEL` | unset | env | Display label for the Graph mailbox |
-| `GRAPH_BASE_URL` | `https://graph.microsoft.com` | env | Graph endpoint for the `OUTLOOK_EMAIL` mailbox |
-| `GRAPH_TOKEN_URL` | `https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token` | env | Token endpoint for the `OUTLOOK_EMAIL` mailbox |
-| `SUPABASE_URL` | unset | settings | Supabase project URL for the accounts table |
-| `SUPABASE_SERVICE_KEY` | unset | settings | Supabase service-role key |
-| `EWS_ACCOUNTS_TABLE` | `ews_accounts` | settings | Accounts table name |
-| `SMARTERMAIL_ENABLED` | `false` | settings | Register the 31 SmarterMail REST tools |
-| `SMARTERMAIL_BASE_URL` | scheme and host of `EWS_SERVER_URL` | settings | SmarterMail web address |
-| `SMARTERMAIL_ADMIN_TOOLS` | `false` | settings | Also register the 8 domain-administration tools |
-| `SMARTERMAIL_TIMEZONE` | unset (uses `TIMEZONE`) | settings | IANA zone for SmarterMail recurring events that name none, for example `Europe/Berlin`. It leaves the other backends on `TIMEZONE`. An unknown zone stops startup |
-| `EWS_MCP_STAGING_DIR` | `/tmp/ews-mcp-staged` | env | Directory for staged outbound files |
-| `RATE_LIMIT_REQUESTS_PER_MINUTE` | `120` | settings | Tool calls per minute. Upstream's default is 25 |
-| `RATE_LIMIT_MAX_WAIT_SECONDS` | `60` | env | How long a tool call waits for a rate-limit slot before it fails |
-| `EWS_THROTTLE_MAX_RETRIES` | `4` | env | `search_emails` retries after EWS throttling |
-| `EWS_THROTTLE_BASE_DELAY` | `3` | env | First backoff delay in seconds, doubled on each retry |
-| `EWS_THROTTLE_MAX_DELAY` | `30` | env | Longest backoff delay in seconds |
-| `OUTBOUND_TRACKING_HEADER` | unset (off) | env | Header name that carries a per-message tracking ID on fresh outbound mail, for example `X-Mail-Tracking-ID`. Recipients can see it. Unset or empty adds no header, and sends report `tracking_id: null` |
-| `EWS_SEARCH_ALL_MAX_FOLDERS` | `50` | env | Most mail folders `search_scope=["all"]` searches on Exchange. A mailbox with more fails with a clear error |
-| `EWS_VERSION` | `auto` | settings | EWS schema version with `EWS_SERVER_URL`. `auto` detects it once and reuses it for every mailbox on that endpoint. Pin it with a product name (`2013_SP1`, `2016`, `2019`, `O365`) or a build number (`15.1.1779.4`) when detection is slow or throttled, for example on hosted SmarterMail. An unknown value stops startup with the accepted list |
+| `MCP_API_KEY` | unset | Key for HTTP clients. Required on a non-loopback bind |
+| `MCP_ALLOW_UNAUTHENTICATED` | `false` | Allow a non-loopback bind without a key |
+| `RATE_LIMIT_REQUESTS_PER_MINUTE` | `120` | Tool calls per minute. Calls wait for a slot |
+| `RATE_LIMIT_MAX_WAIT_SECONDS` | `60` | *env.* Longest wait for a slot before a call fails |
+| `STAGE_UPLOAD_TOKEN` | unset | *env.* Enables `POST /stage` for raw uploads up to 25 MiB |
+| `EWS_MCP_STAGING_DIR` | `/tmp/ews-mcp-staged` | *env.* Directory for staged files |
+| `OUTBOUND_TRACKING_HEADER` | unset | *env.* Header name for a random tracking ID on new outbound mail, returned as `tracking_id`. Recipients can see it |
+| `EWS_SEARCH_ALL_MAX_FOLDERS` | `50` | *env.* Most folders `search_scope=["all"]` searches on Exchange |
+| `EWS_THROTTLE_MAX_RETRIES`, `EWS_THROTTLE_BASE_DELAY`, `EWS_THROTTLE_MAX_DELAY` | `4`, `3`, `30` | *env.* Backoff for EWS throttling in `search_emails` (seconds) |
 
 ### Mailbox accounts
 
-Accounts merge in this order, and a later source wins on the same address:
-the primary `EWS_EMAIL` mailbox, the Supabase table, then `MAIL_ACCOUNTS` and
-the `ICLOUD_*`, `GMAIL_*` and `OUTLOOK_*` variables. An account with missing
-credentials is skipped with a warning.
+Accounts come from four sources. A later source wins on the same address:
+the primary `EWS_EMAIL`, the Supabase table, `MAIL_ACCOUNTS`, then the
+shortcut variables. An account with missing credentials is skipped with a
+warning.
 
-`MAIL_ACCOUNTS` holds a JSON array on one line. As a shell export:
+`MAIL_ACCOUNTS` holds a JSON array:
 
 ```bash
-export MAIL_ACCOUNTS='[{"email":"icloud@example.com","provider":"icloud","password":"app-specific-password"},{"email":"imap@example.com","provider":"imap","password":"secret","imap_host":"imap.example.com","smtp_host":"smtp.example.com"},{"email":"outlook@example.com","provider":"outlook","client_id":"app-client-id","refresh_token":"refresh-token"}]'
+export MAIL_ACCOUNTS='[
+ {"email":"me@icloud.com","provider":"icloud","password":"app-specific-password"},
+ {"email":"me@gmail.com","provider":"gmail","client_id":"...","client_secret":"...","refresh_token":"..."},
+ {"email":"me@example.com","provider":"imap","password":"...","imap_host":"imap.example.com","smtp_host":"smtp.example.com"},
+ {"email":"me@outlook.com","provider":"outlook","client_id":"...","refresh_token":"..."},
+ {"email":"me@fastmail.com","provider":"fastmail","api_token":"..."}
+]'
 ```
 
-In a file for `docker run --env-file`, write `MAIL_ACCOUNTS=[...]` without
-the surrounding quotes, because Docker keeps them as part of the value.
+In a Docker env file write `MAIL_ACCOUNTS=[...]` on one line without
+surrounding quotes.
 
-Each object takes `email`, `password` (or `app_password`), `provider`, an
-optional `label` and connection keys either at the top level or inside a
-`settings` object: `imap_host`, `imap_port` (993), `imap_ssl` (true),
-`imap_username`, `smtp_host`, `smtp_port` (587), `smtp_starttls` (true),
-`smtp_ssl` (false), `smtp_username`, `sent_folder`, `caldav_url`,
-`carddav_url`, `client_id`, `client_secret`, `tenant_id`, `refresh_token`,
-`oauth_token_url`, `graph_base_url`, `graph_token_url`, `graph_scope`,
-`shared_mailbox`, `session_url`, `api_token` and `jmap_username`.
-
-| `provider` | Backend | Preset or requirement |
+| `provider` | Protocol | Needs |
 |---|---|---|
-| `icloud`, `apple` | IMAP/SMTP plus CalDAV/CardDAV | `imap.mail.me.com:993` SSL, `smtp.mail.me.com:587` STARTTLS, iCloud DAV roots |
-| `gmail`, `google` | IMAP/SMTP | `imap.gmail.com:993` SSL, `smtp.gmail.com:587` STARTTLS. An app password, or `client_id`, `client_secret` and `refresh_token` for OAuth |
-| `imap` | IMAP/SMTP | none, set `imap_host` and `smtp_host`. A `refresh_token` with `client_id` and `oauth_token_url` signs in with XOAUTH2 |
-| `outlook`, `graph`, `office365`, `o365`, `m365`, `microsoft365` | Microsoft Graph | needs `client_id` plus `refresh_token` or `client_secret` |
-| `jmap`, `stalwart` | JMAP | set `session_url` (the session resource or `https://host/.well-known/jmap`), plus `api_token` (Bearer) or `password` (Basic, user `jmap_username` or the address) |
-| `fastmail` | JMAP | `https://api.fastmail.com/jmap/session`, set `api_token`. Fastmail DAV needs an app password as `password` |
-| `ews`, `exchange`, `smartermail` | Exchange (EWS) on the primary server | own passwords only from Supabase table rows, see below |
+| `icloud`, `apple` | IMAP/SMTP, CalDAV/CardDAV | App-specific `password`. Hosts and DAV roots are preset |
+| `gmail`, `google` | IMAP/SMTP | App `password`, or `client_id`, `client_secret` and `refresh_token` for OAuth |
+| `imap` | IMAP/SMTP | `password`, `imap_host` and `smtp_host` |
+| `outlook`, `graph`, `office365`, `o365`, `m365`, `microsoft365` | Microsoft Graph | `client_id` plus `refresh_token` (delegated) or `client_secret` (app-only) |
+| `jmap`, `stalwart` | JMAP | `session_url` plus `api_token` (Bearer) or `password` (Basic) |
+| `fastmail` | JMAP | `api_token`. The session URL is preset |
+| `ews`, `exchange`, `smartermail` | EWS on the primary server | `password`, from the Supabase table only |
 
-The Supabase table is read once at startup over the Supabase REST API with
-the service-role key. It needs `email` and `password` columns, and optional
-`provider` (default `ews`) and `settings` (jsonb) columns hold the same keys as
-`MAIL_ACCOUNTS`. Keep row level security enabled with no public policy.
-Exchange rows give additional mailboxes on the primary EWS server their own
-passwords, and they are the only way to do so. Without such a row,
-`target_mailbox` on Exchange needs impersonation or delegate access
-(`EWS_IMPERSONATION_ENABLED=true`, see
-[`docs/legacy/IMPERSONATION.md`](docs/legacy/IMPERSONATION.md)).
+Optional keys, at the top level or in a `settings` object: `label`,
+`imap_port` (993), `imap_ssl` (true), `imap_username`, `smtp_port` (587),
+`smtp_starttls` (true), `smtp_ssl` (false), `smtp_username`, `sent_folder`,
+`caldav_url`, `carddav_url`, `oauth_token_url`, `tenant_id`, `graph_scope`,
+`graph_base_url`, `graph_token_url`, `shared_mailbox` and `jmap_username`.
+Any IMAP account with `client_id` and `refresh_token` signs in with XOAUTH2
+(set `oauth_token_url` outside Google). Fastmail DAV needs an app password as
+`password`, not the API token.
+
+Shortcut variables for one mailbox each:
+
+| Variables | Adds |
+|---|---|
+| `ICLOUD_EMAIL`, `ICLOUD_APP_PASSWORD`, `ICLOUD_LABEL`, `ICLOUD_CALDAV_URL`, `ICLOUD_CARDDAV_URL` | iCloud mail, calendar and contacts |
+| `GMAIL_EMAIL`, `GMAIL_APP_PASSWORD` or `GMAIL_OAUTH_CLIENT_ID`, `GMAIL_OAUTH_CLIENT_SECRET`, `GMAIL_OAUTH_REFRESH_TOKEN`, `GMAIL_OAUTH_TOKEN_URL`, `GMAIL_LABEL` | Gmail. OAuth wins when both are set |
+| `OUTLOOK_EMAIL`, `OUTLOOK_CLIENT_ID`, `OUTLOOK_REFRESH_TOKEN` or `OUTLOOK_CLIENT_SECRET`, `OUTLOOK_TENANT_ID`, `OUTLOOK_GRAPH_SCOPE`, `OUTLOOK_LABEL`, `GRAPH_BASE_URL`, `GRAPH_TOKEN_URL` | Outlook.com or Microsoft 365 over Graph |
+
+The Supabase table (`SUPABASE_URL`, `SUPABASE_SERVICE_KEY`,
+`EWS_ACCOUNTS_TABLE`, default `ews_accounts`) is read once at startup. It
+needs `email` and `password` columns. Optional `provider` and `settings`
+(jsonb) columns take the same keys as `MAIL_ACCOUNTS`. Keep row level
+security on with no public policy.
 
 ### Gmail OAuth sign-in
 
-Gmail accepts an app password or OAuth 2.0. With a `refresh_token`, IMAP and
-SMTP sign in with XOAUTH2 and the server refreshes the access token itself, so
-no other service is involved. You need a Google Cloud OAuth client (Desktop
-app, or Web app with a registered redirect URI) and the restricted
-`https://mail.google.com/` scope on its consent screen.
-
-Get a refresh token once with the sign-in command. It opens a consent URL with
-PKCE and prints the refresh token, the `GMAIL_OAUTH_*` lines and a
-`MAIL_ACCOUNTS` entry:
+With a refresh token, Gmail signs in to IMAP and SMTP with XOAUTH2 and the
+server refreshes the access token itself. You need a Google Cloud OAuth
+client (Desktop app, or Web app with a registered redirect URI) that may
+request the `https://mail.google.com/` scope. Get the refresh token once:
 
 ```bash
-python -m src.mail_backends.google_oauth --email you@gmail.com \
+python -m src.mail_backends.google_oauth --email me@gmail.com \
   --client-id ID.apps.googleusercontent.com --client-secret SECRET --no-listen
 ```
 
-- Without `--no-listen`, a listener on `127.0.0.1` catches the redirect. That
-  works only when the browser runs on the same machine.
-- With `--no-listen`, open the URL anywhere and paste the address the browser
-  was sent to (an error page there is fine) or the bare code. Use this inside
-  the container (`docker exec -it <container> python -m ...`).
-- A Web-app client needs `--redirect-uri` with a URI registered on it, for
-  example `http://localhost:8000/oauth2callback`.
-- `--auth-url`, `--token-url` and `--scope` point the command at another
-  OAuth server.
+Open the printed URL, allow access, then paste the address the browser was
+sent to (an error page there is fine). The command prints the
+`GMAIL_OAUTH_*` lines and a `MAIL_ACCOUNTS` entry. Without `--no-listen` a
+local listener catches the redirect, which only works when the browser runs
+on the same machine. A Web-app client needs `--redirect-uri` with its
+registered URI. In Docker, run it with `docker exec -it <container>`.
 
-Google limits: an app in Testing status issues refresh tokens that expire
-after 7 days, and only its listed test users can consent. Revoking access at
-https://myaccount.google.com/permissions or a password change also ends the
-token. The server then fails with `invalid_grant` and names the command to
-run again. OAuth accounts have no password, so CalDAV/CardDAV is not available
-for them.
-
-## Tool surface
-
-With default settings the server registers 70 tools.
-`SMARTERMAIL_ENABLED=true` adds 31 (101 in total), and
-`SMARTERMAIL_ADMIN_TOOLS=true` adds the remaining 8 (109). Setting
-`ENABLE_EMAIL`, `ENABLE_CALENDAR`, `ENABLE_CONTACTS`, `ENABLE_TASKS` or
-`ENABLE_AGENT` to false removes the matching tools. The runtime `tools/list`
-is authoritative.
-
-| Category | # | Tools |
-|---|---|---|
-| **Email** | 15 | `send_email` · `read_emails` · `search_emails` · `get_email_details` · `get_emails_bulk` · `delete_email` · `move_email` · `copy_email` · `update_email` · `reply_email` · `forward_email` · `create_draft` · `create_reply_draft` · `create_forward_draft` · `update_draft` |
-| **Mailboxes** | 1 | `list_mailboxes` |
-| **Attachments** | 9 | `list_attachments` · `download_attachment` · `add_attachment` · `delete_attachment` · `read_attachment` · `get_email_mime` · `attach_email_to_draft` · `stage_outgoing_file` · `delete_staged_file` |
-| **Calendar** | 7 | `create_appointment` · `get_calendar` · `update_appointment` · `delete_appointment` · `respond_to_meeting` · `check_availability` · `find_meeting_times` |
-| **Contacts** | 5 | `create_contact` · `update_contact` · `delete_contact` · `find_person` · `analyze_contacts` |
-| **Tasks** | 5 | `create_task` · `get_tasks` · `update_task` · `complete_task` · `delete_task` |
-| **Folders** | 3 | `list_folders` · `find_folder` · `manage_folder` |
-| **Search** | 1 | `search_by_conversation` |
-| **Out of office** | 4 | `oof_settings` · `configure_oof_policy` · `get_oof_policy` · `apply_oof_policy` |
-| **Memory** | 4 | `memory_set` · `memory_get` · `memory_list` · `memory_delete` |
-| **Commitments** | 3 | `track_commitment` · `list_commitments` · `resolve_commitment` |
-| **Approvals** | 5 | `submit_for_approval` · `list_pending_approvals` · `approve` · `reject` · `execute_approved_action` |
-| **Voice** | 1 | `get_voice_profile` |
-| **Rules** | 5 | `rule_create` · `rule_list` · `rule_delete` · `rule_simulate` · `evaluate_rules_on_message` |
-| **Compound** | 2 | `generate_briefing` · `prepare_meeting` |
-| **AI** | 1 | `semantic_search_emails`, registered only with `ENABLE_AI=true` and `ENABLE_SEMANTIC_SEARCH=true` |
-
-The per-tool reference is [`docs/legacy/API.md`](docs/legacy/API.md).
+An app in Google's Testing status issues refresh tokens that expire after 7
+days. Revoked or expired tokens fail with `invalid_grant`, and the error
+names the command to run again.
 
 ### SmarterMail REST tools
 
-These tools call SmarterMail's private JSON API at `SMARTERMAIL_BASE_URL`
-and log in with each mailbox's own password: `EWS_PASSWORD` (or its table row)
-for the primary mailbox and the Supabase table for the others. They only work
-against a SmarterMail server and refuse Graph and IMAP mailboxes.
+| Variable | Default | Meaning |
+|---|---|---|
+| `SMARTERMAIL_ENABLED` | `false` | Register 31 SmarterMail tools |
+| `SMARTERMAIL_ADMIN_TOOLS` | `false` | Also register 8 domain-administration tools |
+| `SMARTERMAIL_BASE_URL` | host of `EWS_SERVER_URL` | SmarterMail web address |
+| `SMARTERMAIL_TIMEZONE` | `TIMEZONE` | Zone for recurring events that name none |
 
-| Group | Tools |
+The tools log in with each mailbox's own password and work only against a
+SmarterMail server. The admin tools need a domain administrator and can
+create, rename, disable and delete mailboxes.
+
+## Tools
+
+The server registers 70 tools by default, 101 with `SMARTERMAIL_ENABLED` and
+109 with `SMARTERMAIL_ADMIN_TOOLS`. `ENABLE_EMAIL`, `ENABLE_CALENDAR`,
+`ENABLE_CONTACTS`, `ENABLE_TASKS` and `ENABLE_AGENT` set to false remove
+their tools. The runtime `tools/list` is authoritative.
+
+| Category | Tools |
 |---|---|
-| Mail | `schedule_email` · `list_scheduled_emails` · `cancel_scheduled_email` · `undo_send` · `bulk_update_emails` · `export_emails` · `unsubscribe_email` · `manage_mail_classification` |
-| Settings | `manage_signatures` · `manage_senders` · `manage_auto_clean` · `manage_notes` · `manage_disposable_address` · `manage_notifications` · `manage_auto_complete` · `manage_account_security` |
-| Calendar and contacts | `manage_recurring_event` · `update_event_occurrence` · `manage_calendars` · `manage_internet_calendars` · `import_export_calendar` · `manage_address_books` · `manage_contacts_bulk` |
-| Workspace | `manage_virtual_folders` · `manage_folder_sharing` · `manage_file_storage` · `attach_file_link` · `manage_rss_feeds` · `search_chat_history` · `mailbox_usage_report` · `manage_connected_services` |
-| Domain admin | `manage_domain_users` · `manage_user_access` · `manage_domain_aliases` · `manage_mailing_lists` · `manage_user_groups` · `manage_domain_mail_policy` · `manage_event_hooks` · `manage_mailbox_migration` |
+| Email | `send_email` · `read_emails` · `search_emails` · `get_email_details` · `get_emails_bulk` · `delete_email` · `move_email` · `copy_email` · `update_email` · `reply_email` · `forward_email` · `create_draft` · `create_reply_draft` · `create_forward_draft` · `update_draft` |
+| Mailboxes | `list_mailboxes` |
+| Attachments | `list_attachments` · `download_attachment` · `add_attachment` · `delete_attachment` · `read_attachment` · `get_email_mime` · `attach_email_to_draft` · `stage_outgoing_file` · `delete_staged_file` |
+| Calendar | `create_appointment` · `get_calendar` · `update_appointment` · `delete_appointment` · `respond_to_meeting` · `check_availability` · `find_meeting_times` |
+| Contacts | `create_contact` · `update_contact` · `delete_contact` · `find_person` · `analyze_contacts` |
+| Tasks | `create_task` · `get_tasks` · `update_task` · `complete_task` · `delete_task` |
+| Folders and search | `list_folders` · `find_folder` · `manage_folder` · `search_by_conversation` |
+| Out of office | `oof_settings` · `configure_oof_policy` · `get_oof_policy` · `apply_oof_policy` |
+| Agent | `memory_set` · `memory_get` · `memory_list` · `memory_delete` · `track_commitment` · `list_commitments` · `resolve_commitment` · `submit_for_approval` · `list_pending_approvals` · `approve` · `reject` · `execute_approved_action` · `get_voice_profile` · `rule_create` · `rule_list` · `rule_delete` · `rule_simulate` · `evaluate_rules_on_message` · `generate_briefing` · `prepare_meeting` |
+| AI | `semantic_search_emails`, with `ENABLE_AI=true` and `ENABLE_SEMANTIC_SEARCH=true` |
+| SmarterMail | `schedule_email` · `list_scheduled_emails` · `cancel_scheduled_email` · `undo_send` · `bulk_update_emails` · `export_emails` · `unsubscribe_email` · `manage_mail_classification` · `manage_signatures` · `manage_senders` · `manage_auto_clean` · `manage_notes` · `manage_disposable_address` · `manage_notifications` · `manage_auto_complete` · `manage_account_security` · `manage_recurring_event` · `update_event_occurrence` · `manage_calendars` · `manage_internet_calendars` · `import_export_calendar` · `manage_address_books` · `manage_contacts_bulk` · `manage_virtual_folders` · `manage_folder_sharing` · `manage_file_storage` · `attach_file_link` · `manage_rss_feeds` · `search_chat_history` · `mailbox_usage_report` · `manage_connected_services` |
+| SmarterMail admin | `manage_domain_users` · `manage_user_access` · `manage_domain_aliases` · `manage_mailing_lists` · `manage_user_groups` · `manage_domain_mail_policy` · `manage_event_hooks` · `manage_mailbox_migration` |
 
-- `SMARTERMAIL_ENABLED=true` registers the first four groups.
-- `SMARTERMAIL_ADMIN_TOOLS=true` also registers the domain-admin group. Those
-  tools need a domain administrator account and can create, rename, disable
-  and delete mailboxes.
-- When a call names no time zone, the recurring-event tools use
-  `SMARTERMAIL_TIMEZONE`, else the server `TIMEZONE` setting (UTC unless set).
-- `storage_file_id` attachment sources also need `SMARTERMAIL_ENABLED=true`.
+- Attach files with `files`. Each entry is a server `file_path`, base64
+  `file_content` with `file_name`, a `file_url` the server fetches (public
+  HTTP(S) only, 25 MiB), a SmarterMail `storage_file_id`, or a path from
+  `stage_outgoing_file` (expires after one hour by default).
+- `send_email`, `reply_email` and `forward_email` accept `dry_run=true`.
+  Send results report `accepted_by_mail_server`, never delivery.
+- `get_email_details` returns markdown bodies (`format="html"` for HTML).
+  `read_attachment` returns 8000 characters per call (page with `offset`).
+  Base64 downloads over 64 KiB need a higher `max_bytes`.
 
-## Provider scope and limits
-
-Support is per operation, not full Exchange parity. Use `list_mailboxes` to see
-each configured account and its `capabilities`, and pass `target_mailbox` (or
-its alias `mailbox`) to select one. Omitting it uses the primary mailbox.
+## Provider support
 
 | Capability | Exchange | Graph | IMAP/SMTP | JMAP |
 |---|---|---|---|---|
-| Folders, read, search, details, move, delete | Yes | Yes | Yes. IDs are folder-scoped | Yes. IDs are mailbox-wide and survive moves |
-| Send, reply, forward with `files` and send a saved draft | Yes | Yes. New `files` up to 3 MiB in total | Yes. SMTP acceptance is not delivery | Yes, through `EmailSubmission`. Acceptance is not delivery |
-| Create compose, reply and forward drafts and `update_draft` | Yes | Yes | Yes. Edits rewrite the message and change IDs | Yes. Edits replace the draft and change IDs |
-| Attachments and raw MIME | Yes | Yes. Changes only on drafts | Yes. Changes only in Drafts | Yes. Changes only on drafts |
-| Search by recipient, body text or read mail (`is_read=true`) | Yes | No | No | Yes |
-| Calendar event CRUD | Yes | Yes, with calendar consent | iCloud, or any account with `caldav_url`, through CalDAV | With `caldav_url`, through CalDAV |
-| Recurring series and reminders | Yes. Occurrence vs `scope="series"` guard | Yes | Reminders yes; creating a series is refused | Same as IMAP |
-| Whole-mailbox search (`search_scope=["all"]`) | Advanced and full_text | Quick and full_text | No | Quick and full_text |
-| Follow-up flag state (`flag_status`) | NotFlagged, Flagged, Complete | NotFlagged, Flagged, Complete | Flagged and NotFlagged only | Flagged and NotFlagged only |
-| Free/busy and meeting-time suggestions | Yes | Organization accounts only | No | No |
-| Contact CRUD and `find_person` | Yes, including GAL and mail history | Contacts only, with contact consent | Through CardDAV, contacts only | With `carddav_url`, through CardDAV |
-| Tasks, `analyze_contacts` and other EWS-only tools | Yes | No | No | No |
-| Scheduled send and undo | SmarterMail REST tools only | No | No | No |
+| Folders, read, search, move, delete | Yes | Yes | Yes. IDs are per folder | Yes. IDs survive moves |
+| Send, reply, forward, drafts | Yes | Yes. New files up to 3 MiB | Yes. Draft edits change IDs | Yes. Draft edits change IDs |
+| Attachment changes | Yes | Drafts only | Drafts only | Drafts only |
+| Search by recipient, body or read mail | Yes | No | No | Yes |
+| Search all folders | Yes | Yes | No | Yes |
+| Flag states | Flagged, NotFlagged, Complete | Flagged, NotFlagged, Complete | Flagged, NotFlagged | Flagged, NotFlagged |
+| Calendar | Yes, with recurring series | Yes, with calendar consent | Over CalDAV, no new series | Over CalDAV, no new series |
+| Free/busy and meeting times | Yes | Organization accounts | No | No |
+| Contacts | Yes, with directory | Yes, with contact consent | Over CardDAV | Over CardDAV |
+| Tasks and contact analytics | Yes | No | No | No |
+| Scheduled send | SmarterMail only | No | No | No |
 
-- For IMAP messages outside Inbox, pass the source `folder`. Keep the
-  mailbox, folder and current message ID together, and use the fresh IDs a
-  draft edit or attachment change returns.
-- Use canonical `files` for attachments. `file_path` names a file on the
-  server, never on the caller's machine. A remote client sends base64
-  `file_content` with `file_name`, a `file_url` the server fetches (HTTP(S)
-  only, private and loopback addresses refused, 25 MiB), a SmarterMail
-  `storage_file_id`, or a `file_path` returned by `stage_outgoing_file`.
-  Staged files expire after one hour by default (one minute to 24 hours).
-  `POST /stage` stages a raw request body of up to 25 MiB when
-  `STAGE_UPLOAD_TOKEN` is set. Legacy `attachments` and `inline_attachments`
-  remain on Exchange only and are deprecated.
-- `send_email`, `reply_email` and `forward_email` accept `dry_run=true`, and
-  `verify_files=true` loads every file during the dry run.
-- Send results report `accepted_by_mail_server` and
-  `delivery_confirmed: false`, never delivery. With `OUTBOUND_TRACKING_HEADER`
-  set, fresh outbound messages carry that header with a random ID, returned as
-  `tracking_id`. It is off by default, and messages the provider composes
-  server-side (Graph replies and forwards) always report `tracking_id: null`.
-- Queue removal or an undo acknowledgment from SmarterMail does not prove that
-  delivery was prevented and cannot recall delivered mail.
-- `search_emails` runs one search at a time per process and retries EWS
-  throttling (`ErrorServerBusy`, HTTP 429) with exponential backoff.
-
-Details: [conventions and provider scope](docs/legacy/API.md#conventions),
-[drafts](docs/legacy/API.md#drafts),
-[draft recovery](docs/legacy/API.md#draft-recovery),
-[attachment flows](docs/legacy/API.md#efficient-attachment-flows) and
-[attachment sources](docs/legacy/API.md#attachment-sources).
-
-### Defaults that differ from upstream 4.0
-
-- `get_email_details` returns bodies as markdown by default. Pass
-  `format="html"` for the previous output.
-- `read_attachment` returns up to 8000 characters per call. Page with
-  `offset` or raise `max_chars`. Base64 `download_attachment` and
-  `get_email_mime` refuse payloads over 64 KiB unless `max_bytes` is raised.
-- The rate limit is 120 tool calls per minute, and calls wait for a slot.
-- Startup does not test the Exchange connection. It opens on the first tool
-  call.
-- With `EWS_SERVER_URL` set, the EWS version is detected once and reused
-  for every mailbox on that endpoint (`EWS_VERSION=auto`) unless you pin it.
+Keep the folder with each IMAP message ID, and use the new IDs a draft edit
+returns. See [`docs/API.md`](docs/API.md) for conventions, drafts and
+attachment flows.
 
 ## Tests
-
-Upstream has no `tests/` directory. The fork's suite runs inside the image:
 
 ```bash
 docker build -t ews-mcp .
@@ -390,22 +265,14 @@ docker run --rm -v "$PWD:/app" -w /app --entrypoint sh ews-mcp \
 
 ## Documentation
 
-| | |
-|---|---|
-| [`docs/README.md`](docs/README.md) | Documentation map for both server lines |
-| [`docs/legacy/API.md`](docs/legacy/API.md) | 4.0 tool reference, including provider scope, drafts, attachments and the SmarterMail scheduling tools |
-| [`docs/legacy/SETUP.md`](docs/legacy/SETUP.md) | Exchange setup and authentication |
-| [`docs/legacy/CONNECTION_GUIDE.md`](docs/legacy/CONNECTION_GUIDE.md) | Client connection recipes |
-| [`docs/legacy/TROUBLESHOOTING.md`](docs/legacy/TROUBLESHOOTING.md) | Common failures, including provider and attachment issues |
-| [`docs/legacy/REPLY_FORWARD.md`](docs/legacy/REPLY_FORWARD.md) | Reply and forward behaviour per provider |
-| [`docs/legacy/AGENT_SECRETARY.md`](docs/legacy/AGENT_SECRETARY.md) | Memory, commitments, approvals, rules, briefings |
-| [`docs/legacy/IMPERSONATION.md`](docs/legacy/IMPERSONATION.md) | Exchange impersonation and delegate access |
-| [`v5/README.md`](v5/README.md) | Upstream's 4.5 server |
-| [CHANGELOG.md](CHANGELOG.md) | Fork changes, then upstream history |
+- [`docs/API.md`](docs/API.md): tool reference and conventions
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md): common failures
+- [`docs/IMPERSONATION.md`](docs/IMPERSONATION.md): Exchange impersonation and delegate access
+- [`CHANGELOG.md`](CHANGELOG.md): changes
 
-## Credits and license
+`v5/` contains a separate server with its own [README](v5/README.md).
+Nothing above applies to it.
 
-The server is the work of the upstream
-[azizmazrou/ews-mcp](https://github.com/azizmazrou/ews-mcp) project. This fork
-builds on it. See [CONTRIBUTING.md](CONTRIBUTING.md) for upstream's
-contribution guide. MIT, see [LICENSE](LICENSE).
+## License
+
+MIT, see [LICENSE](LICENSE).

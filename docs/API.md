@@ -1,15 +1,8 @@
-> **Legacy 4.0 documentation.** This page describes the `src/` server as
-> extended by this fork. Upstream's `ghcr.io/azizmazrou/ews-mcp:latest` image
-> does not include the fork's additions, and the fork publishes no image (see
-> the [README](../../README.md#quick-start)). For upstream's 4.5 line see
-> [`v5/README.md`](../../v5/README.md) and [`v5/docs/API.md`](../../v5/docs/API.md).
+# API Reference
 
-# API Reference — v4.0
-
-This reference covers the v4 core tools and this fork's mail workflows;
-it is not an exhaustive inventory of the configured server. Optional
-SmarterMail tools and fork additions change the available set. Use the
-runtime `tools/list` for available tools and canonical input schemas.
+This reference explains the core tools and mail workflows. It does not list
+every tool. Optional SmarterMail tools change the available set, and the
+runtime `tools/list` has the available tools and canonical input schemas.
 This document explains intent, non-obvious parameters and response shapes.
 
 Sections:
@@ -35,8 +28,8 @@ Sections:
 ### `target_mailbox` (multi-mailbox)
 
 Use `list_mailboxes` to discover configured accounts and `target_mailbox: <smtp>`
-to select one. Omit it to use the primary mailbox. Configured Graph/IMAP
-accounts use their own credentials; Exchange impersonation/delegate access
+to select one. Omit it to use the primary mailbox. Configured Graph, IMAP and
+JMAP accounts use their own credentials; Exchange impersonation/delegate access
 requires the appropriate rights and `EWS_IMPERSONATION_ENABLED=true`.
 
 Each `list_mailboxes` entry reports boolean `capabilities`: `drafts_create`,
@@ -140,8 +133,8 @@ the error text. See [draft recovery](#draft-recovery).
 
 11 core tools covering the email lifecycle, plus the opt-in SmarterMail
 scheduling tools. The draft tools are under [Drafts](#drafts). `send_email`,
-`reply_email` and `forward_email` accept the v4 `body_format` for
-markdown→HTML server-side conversion.
+`reply_email` and `forward_email` accept `body_format` for server-side
+markdown to HTML conversion.
 
 ### `send_email`
 
@@ -306,7 +299,7 @@ Three modes selected via `mode`:
 | `advanced` | Combinable filters + sort + scope across multiple folders. | Multi-criterion queries |
 | `full_text` | Exchange `searchquery` engine. | Prose / phrase search |
 
-**v4-relevant parameters**
+**Parameters**
 
 | Name | Type | Notes |
 |---|---|---|
@@ -338,11 +331,11 @@ To list (a full address must match exactly). Graph/IMAP search refuses
 
 Full message including body, attachments metadata, threading.
 
-**v4 parameters (highlight)**
+**Parameters (highlights)**
 
 | Name | Type | Default | Notes |
 |---|---|---|---|
-| `format` | `"html"\|"markdown"\|"text"` | `markdown` | **the marquee v4 read-side feature.** `markdown` runs the Outlook MSO body through `markdownify` server-side (cached in SQLite forever — Exchange messages are immutable post-send), returning ~12× fewer tokens. Pass `html` for the HTML body. |
+| `format` | `"html"\|"markdown"\|"text"` | `markdown` | `markdown` converts the body server-side (cached, since sent messages do not change) and uses far fewer tokens. Pass `html` for the HTML body. |
 | `trim_quoted` | `bool` | false | strips `On …, X wrote:` thread history. Big savings on long threads. |
 | `include_body` | `bool` | true | when false, both `body` and `body_html` drop from the response |
 | `fields` | `string[]` | — | response projection |
@@ -416,7 +409,7 @@ quote the original body or copy its inline images.
 
 | Name | Notes |
 |---|---|
-| `body_format` | `html` / `markdown` / `text` (v4) |
+| `body_format` | `html` / `markdown` / `text` |
 | `reply_all` | bool, default false. The sender and original To go in To, the original Cc stays in Cc, without your own address or duplicates |
 | `cc`, `bcc` | extra recipient arrays on all three providers. Cc joins the derived recipients; Bcc holds only these. Each address is listed once, case-insensitively. IMAP keeps Bcc blind by removing a Bcc address from To/Cc |
 | `files` | canonical attachments on **all three providers**; same schema as `send_email`. All files are loaded before sending. |
@@ -668,9 +661,9 @@ sources (error messages are capped at 200 characters; `hint` is not).
 
 ## Attachments
 
-9 tools. The v4 changes: `read_attachment` text extraction and remote
-content sources for `add_attachment`; `stage_outgoing_file` /
-`delete_staged_file` put outbound bytes on the server for remote agents.
+9 tools: text extraction with `read_attachment`, remote content sources for
+`add_attachment`, and `stage_outgoing_file` / `delete_staged_file` to put
+outbound bytes on the server for remote agents.
 
 ### `read_attachment`
 
@@ -822,9 +815,9 @@ for archiving, audit, and forensics.
 
 | Tool | Highlights |
 |---|---|
-| `create_appointment` | `subject`, `start_time`, `end_time`, `location`, `body`, `attendees`, `is_all_day`, `reminder_minutes` (default 15; `0` at start, `null` none), **`categories`** (v4), `recurrence` (see below) |
+| `create_appointment` | `subject`, `start_time`, `end_time`, `location`, `body`, `attendees`, `is_all_day`, `reminder_minutes` (default 15; `0` at start, `null` none), **`categories`**, `recurrence` (see below) |
 | `get_calendar` | range query, returns events with `item_id`, `subject`, `start`, `end`, `location`, `organizer`, `attendees`, `is_all_day`, `type` (`single`, `occurrence`, `exception`, `series_master`), `series_master_id`, `reminder_minutes`; `include_recurrence=true` adds each series' rule |
-| `update_appointment` | `item_id` plus optional fields to update; `categories` v4; `reminder_minutes` (`null` clears); `scope="series"` to change a whole series |
+| `update_appointment` | `item_id` plus optional fields to update; `categories`; `reminder_minutes` (`null` clears); `scope="series"` to change a whole series |
 | `delete_appointment` | optional `send_cancellation: bool` (default true); `scope="series"` to delete a whole series |
 | `respond_to_meeting` | `response: "Accept" / "Decline" / "Tentative"` + optional body |
 | `check_availability` | `email_addresses[]`, `start_time`, `end_time`, returns free/busy |
@@ -958,10 +951,10 @@ which pre-built report runs:
 
 ### `create_contact` / `update_contact` / `delete_contact`
 
-Contact CRUD is routed on Exchange and Graph, using IDs from the selected
-mailbox. v4 adds `categories: list[str]` to create and update. Graph contact
-access requires its own scopes and consent; a working Graph mail token is not
-proof of contact authorization. IMAP has no contact route.
+Contact CRUD is routed on Exchange and Graph, and on IMAP and JMAP accounts
+with a `carddav_url`, using IDs from the selected mailbox. Create and update
+accept `categories: list[str]`. Graph contact access requires its own scopes
+and consent; a working Graph mail token is not proof of contact authorization.
 
 Graph uses `Contacts.ReadWrite` for the supported read/write contact workflow.
 If authorization fails, grant or re-consent that permission for the mailbox's
@@ -986,9 +979,9 @@ an ID from another account is not an interchangeable contact handle.
 
 | Tool | Notes |
 |---|---|
-| `create_task` | `subject`, `body`, `due_date`, `start_date`, `importance`, `reminder_time`, **`categories`** (v4) |
+| `create_task` | `subject`, `body`, `due_date`, `start_date`, `importance`, `reminder_time`, **`categories`** |
 | `get_tasks` | filter by status / completion |
-| `update_task` | partial update; `categories` (v4) |
+| `update_task` | partial update; `categories` |
 | `complete_task` | sets status to Completed |
 | `delete_task` | |
 
@@ -1034,11 +1027,7 @@ to permanent delete with an explicit response label
 ### `search_by_conversation`
 
 Walk every mail folder by default and gather every message in a
-thread. Custom-label / archived messages are not invisible. v4 fix:
-`conversation_id` is wrapped in a typed `ConversationId` before
-`folder.filter(...)` so the EWS SOAP restriction builds correctly
-(was emitting `TypeError` per folder in v3.4 against newer
-exchangelib versions).
+thread, including custom-label and archived messages.
 
 ```jsonc
 {
@@ -1066,7 +1055,7 @@ exchangelib versions).
 
 | Tool | Purpose |
 |---|---|
-| `oof_settings` | Get / set the user's OOF state. v4 fixes: preserves omitted reply text, normalises Scheduled `start`/`end` to UTC (fixes `InvalidScheduledOofDuration`), returns `currently_active` in the set response |
+| `oof_settings` | Get / set the user's OOF state. Omitted reply text is kept, Scheduled `start`/`end` are normalised to UTC, and the set response includes `currently_active` |
 | `configure_oof_policy` | Persist a templated policy (auto-replies + forward rules + VIP passthrough) into the agent-side memory store |
 | `get_oof_policy` | Retrieve the stored policy |
 | `apply_oof_policy` | Evaluate the policy against an inbound message — **creates DRAFTS, never sends**, so the user can review |
@@ -1132,9 +1121,8 @@ gated behind `ENABLE_AGENT=true` (default).
 
 ### Commitments
 
-Manual CRUD only. The auto-extraction tool (`extract_commitments`)
-was removed in v4; the consuming agent should detect commitments
-in-prompt and call `track_commitment` for each.
+Manual CRUD only. The consuming agent detects commitments in its own
+prompt and calls `track_commitment` for each.
 
 | Tool | Purpose |
 |---|---|
@@ -1158,9 +1146,8 @@ consumes the approval and runs the original tool.
 ### Voice profile
 
 `get_voice_profile` returns the stored style card (formality,
-greetings, signoffs, sample examples). v4 removed
-`build_voice_profile`; the agent builds the profile in-prompt from
-sample sent items and persists it via `memory_set`.
+greetings, signoffs, sample examples). The agent builds the profile from
+sample sent items in its own prompt and stores it with `memory_set`.
 
 ### Rule engine
 
@@ -1185,9 +1172,7 @@ in the memory KV.
 ## Compound tools
 
 These two tools return **structured JSON context** so the consuming
-agent can compose prose itself. They do not call an LLM. (In v3.x
-they did — that's been deliberately moved skill-side per the v4
-"MCP / skill boundary" principle.)
+agent can compose prose itself. They do not call an LLM.
 
 ### `generate_briefing`
 
@@ -1216,20 +1201,3 @@ context it needs to brief you on the meeting.
 | `history_per_attendee` | int |
 | `extract_attachment_text` | bool — runs `read_attachment` on each meeting attachment |
 
----
-
-## Removed in v4 (reasoning moved skill-side)
-
-The following tools existed in v3.x and have been deliberately
-**removed** — the consuming agent already has an LLM and can do these
-tasks in-prompt with the data this MCP returns, which is faster,
-cheaper, and produces better results than a second LLM hop:
-
-- `classify_email`
-- `summarize_email`
-- `suggest_replies`
-- `extract_commitments` (the auto-extraction; manual `track_commitment` remains)
-- `build_voice_profile` (the LLM tone analysis; storage via `memory_set` remains)
-
-See the [v4.0.0 entry in CHANGELOG.md](../CHANGELOG.md#v400--2026-05-03)
-for the rationale and the in-prompt replacement pattern.

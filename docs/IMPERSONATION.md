@@ -1,14 +1,8 @@
-> **Legacy 4.0 documentation.** This page describes upstream's `src/` server,
-> which upstream ships as `ghcr.io/azizmazrou/ews-mcp:latest`. This fork
-> extends that server and publishes no image, so build it from source as the
-> [README](../../README.md#quick-start) describes. For upstream's 4.5 line see
-> [`v5/README.md`](../../v5/README.md) and [`v5/docs/API.md`](../../v5/docs/API.md).
-
 # Impersonation / Delegation Support
 
 EWS MCP Server supports operating on behalf of other users through Exchange impersonation or delegation. This allows a service account to access multiple mailboxes without requiring separate credentials for each user.
 
-> **Note:** every base mailbox tool accepts a `target_mailbox` parameter. The single AI tool in v4 (`semantic_search_emails`) currently ignores `target_mailbox` and always operates on the primary authenticated mailbox; the other AI tools that existed in v3.x have been removed (their work is now done in-prompt by the consuming agent — see [ARCHITECTURE.md](ARCHITECTURE.md#mcp--skill-boundary)).
+> **Note:** every mailbox tool accepts `target_mailbox`. `semantic_search_emails` ignores it and always uses the primary mailbox.
 
 ## Overview
 

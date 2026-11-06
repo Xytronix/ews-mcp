@@ -1,6 +1,6 @@
 version: '3.8'
 
-# EWS MCP (fork). Builds the image from source.
+# EWS MCP Server. Builds the image from source.
 #
 # The image serves streamable-http on 0.0.0.0:8000 (MCP endpoint /mcp,
 # health /health). With network_mode: host that port is open on the host,

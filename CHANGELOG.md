@@ -1,10 +1,6 @@
 # Changelog
 
-## Fork additions (4.0 line, `src/`)
-
-This fork of [azizmazrou/ews-mcp](https://github.com/azizmazrou/ews-mcp)
-extends the 4.0 server in `src/`. The 4.5 server in `v5/` is unchanged.
-Upstream's history follows from `[Unreleased]` on.
+## Unreleased
 
 ### Added
 
@@ -224,22 +220,19 @@ Upstream's history follows from `[Unreleased]` on.
 - Resolve rewritten draft UIDs before retiring originals; return current mailbox/folder-bound IDs and fresh attachment part IDs.
 - Report partial SMTP refusal as `sent: false`, with accepted/refused recipients. Sent-copy failures do not imply submission failed; never retry accepted recipients blindly.
 
-## [Unreleased]
-
 ### Documentation
-- Repository-wide revamp: the root README is now a single front door
-  (version guide, stdio-first quick start); `docs/README.md` maps all
-  documentation; the ten 4.0-era documents moved to `docs/legacy/` with
-  banners; `v5/docs/API.md` gained a generated per-tool parameter
-  reference (`dump_tool_table.py` now emits and drift-checks it).
+
+- The README is the single setup and configuration guide. `docs/` keeps the
+  tool reference, troubleshooting and impersonation guides. The setup,
+  connection, deployment, architecture, pitfalls, agent-secretary and
+  reply/forward guides were folded into the README or removed.
 
 ### Removed
-- Legacy helper scripts (`run.sh`, `scripts/build.sh`,
-  `scripts/deploy.sh`, `scripts/setup.sh`,
-  `scripts/setup-basic-auth.sh`) and redundant configuration examples
-  (`.env.basic.example`, `.env.oauth2.example`, `.env.ai.example`).
-  One template per line remains: root `.env.example` (4.0) and
-  `v5/.env.example` (4.5).
+
+- Helper scripts (`run.sh`, `scripts/build.sh`, `scripts/deploy.sh`,
+  `scripts/setup.sh`, `scripts/setup-basic-auth.sh`) and the extra
+  configuration examples (`.env.basic.example`, `.env.oauth2.example`,
+  `.env.ai.example`). `.env.example` is the one template.
 
 ## [4.5.0a1] - 2026-07-11 (pre-release; the `v5/` tree)
 
