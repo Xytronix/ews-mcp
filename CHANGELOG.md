@@ -92,8 +92,11 @@ Upstream's history follows from `[Unreleased]` on.
   in the Supabase table instead of `EWS_PASSWORD`.
 - Startup no longer tests the Exchange connection. It opens on the first tool
   call.
-- With `EWS_SERVER_URL` set, the EWS version is pinned to Exchange 2016
-  (15.1) instead of detected. The auth scheme is set from `EWS_AUTH_TYPE`.
+- With `EWS_SERVER_URL` set, `EWS_VERSION` chooses the EWS schema version.
+  The default `auto` detects it once and reuses the answer for every mailbox
+  on that endpoint. A product name (`2016`, `2019`, `2013_SP1`, `O365`) or a
+  build number pins it, and an unknown value stops startup. It was previously
+  hard-coded to Exchange 2016. The auth scheme is set from `EWS_AUTH_TYPE`.
 
 ### Fixed
 

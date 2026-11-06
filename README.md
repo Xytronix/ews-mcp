@@ -174,6 +174,7 @@ Source `env` means it is read from the process environment only.
 | `EWS_THROTTLE_MAX_DELAY` | `30` | env | Longest backoff delay in seconds |
 | `OUTBOUND_TRACKING_HEADER` | unset (off) | env | Header name that carries a per-message tracking ID on fresh outbound mail, for example `X-Mail-Tracking-ID`. Recipients can see it. Unset or empty adds no header, and sends report `tracking_id: null` |
 | `EWS_SEARCH_ALL_MAX_FOLDERS` | `50` | env | Most mail folders `search_scope=["all"]` searches on Exchange. A mailbox with more fails with a clear error |
+| `EWS_VERSION` | `auto` | settings | EWS schema version with `EWS_SERVER_URL`. `auto` detects it once and reuses it for every mailbox on that endpoint. Pin it with a product name (`2013_SP1`, `2016`, `2019`, `O365`) or a build number (`15.1.1779.4`) when detection is slow or throttled, for example on hosted SmarterMail. An unknown value stops startup with the accepted list |
 
 ### Mailbox accounts
 
@@ -331,8 +332,8 @@ Details: [conventions and provider scope](docs/legacy/API.md#conventions),
 - The rate limit is 120 tool calls per minute, and calls wait for a slot.
 - Startup does not test the Exchange connection. It opens on the first tool
   call.
-- With `EWS_SERVER_URL` set, the EWS version is pinned to Exchange 2016
-  (15.1) instead of detected.
+- With `EWS_SERVER_URL` set, the EWS version is detected once and reused
+  for every mailbox on that endpoint (`EWS_VERSION=auto`) unless you pin it.
 
 ## Tests
 

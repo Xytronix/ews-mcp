@@ -1,21 +1,16 @@
 """Exchange Web Services client wrapper."""
 
-from exchangelib import Account, Configuration, Credentials, BASIC, NTLM, OAUTH2, Build, DELEGATE, IMPERSONATION, FaultTolerance, Version, EWSTimeZone
+from exchangelib import Account, Configuration, Credentials, BASIC, NTLM, OAUTH2, DELEGATE, IMPERSONATION, FaultTolerance, Version, EWSTimeZone
 from exchangelib.protocol import BaseProtocol, NoVerifyHTTPAdapter
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, retry_if_not_exception_type
 import logging
 import pytz
 from typing import Optional, Dict
 
-from .config import Settings
+from .config import Settings, parse_ews_version
 from .auth import AuthHandler
 from .exceptions import EWSConnectionError, AuthenticationError
 
-
-# SmarterMail reports Exchange2016 (build 15.1.1779.4) over EWS. Pinning the
-# version skips exchangelib's version-detection round-trips (which also tripped
-# SmarterMail's per-IP throttle as a request burst).
-EWS_VERSION = Version(build=Build(15, 1, 1779, 4))
 
 # exchangelib auth scheme per configured EWS_AUTH_TYPE. SmarterMail needs the
 # scheme pinned (its EWS endpoint 401s exchangelib's auth probing), but the pin
@@ -33,6 +28,10 @@ class EWSClient:
         self.logger = logging.getLogger(__name__)
         self._account: Optional[Account] = None
         self._impersonated_accounts: Dict[str, Account] = {}
+        # EWS_VERSION pins the schema version. With "auto" the first account
+        # on EWS_SERVER_URL detects it and later mailboxes reuse the answer.
+        self._configured_version = parse_ews_version(getattr(config, "ews_version", None))
+        self._detected_version: Optional[Version] = None
 
         self._sqlite_cache = None
         self._mailbox_registry = None
@@ -168,7 +167,7 @@ class EWSClient:
                     service_endpoint=ews_url,
                     credentials=credentials,
                     auth_type=self._auth_type(),
-                    version=EWS_VERSION,
+                    version=self._ews_version(),
                     retry_policy=FaultTolerance(max_wait=120),
                     max_connections=self.config.connection_pool_size
                 )
@@ -182,6 +181,7 @@ class EWSClient:
                     access_type=DELEGATE,
                     default_timezone=tz
                 )
+                self._remember_version(account)
             else:
                 raise EWSConnectionError(
                     "No EWS_SERVER_URL provided and EWS_AUTODISCOVER is disabled. "
@@ -195,6 +195,22 @@ class EWSClient:
         except Exception as e:
             self.logger.error(f"Failed to create account: {e}")
             raise EWSConnectionError(f"Failed to connect to Exchange: {e}")
+
+    def _ews_version(self) -> Optional[Version]:
+        """Version for a Configuration on EWS_SERVER_URL; None lets exchangelib detect it.
+
+        Detection tries API versions until the server answers, a burst of
+        requests that a throttling server (hosted SmarterMail) can refuse.
+        Reusing the first answer makes N mailboxes cost one detection.
+        """
+        if self._configured_version is not None:
+            return self._configured_version
+        return self._detected_version
+
+    def _remember_version(self, account: Account) -> None:
+        """Keep the version the first EWS_SERVER_URL account detected."""
+        if self._configured_version is None and self._detected_version is None:
+            self._detected_version = getattr(account, "version", None)
 
     def test_connection(self) -> bool:
         """Test EWS connection."""
@@ -255,7 +271,7 @@ class EWSClient:
                 service_endpoint=self._get_ews_url(),
                 credentials=Credentials(username=target_mailbox, password=mailbox_password),
                 auth_type=self._auth_type(),
-                version=EWS_VERSION,
+                version=self._ews_version(),
                 retry_policy=FaultTolerance(max_wait=120),
                 max_connections=self.config.connection_pool_size,
             )
@@ -266,6 +282,7 @@ class EWSClient:
                 access_type=DELEGATE,
                 default_timezone=tz,
             )
+            self._remember_version(account)
             self._impersonated_accounts[cache_key] = account
             return account
 
@@ -288,7 +305,7 @@ class EWSClient:
                     service_endpoint=self._get_ews_url(),
                     credentials=credentials,
                     auth_type=self._auth_type(),
-                    version=EWS_VERSION,
+                    version=self._ews_version(),
                     retry_policy=FaultTolerance(max_wait=120),
                     max_connections=self.config.connection_pool_size,
                 )
@@ -299,6 +316,7 @@ class EWSClient:
                     access_type=access_type,
                     default_timezone=tz,
                 )
+                self._remember_version(impersonated_account)
             elif self.config.ews_autodiscover:
                 impersonated_account = Account(
                     primary_smtp_address=target_mailbox,

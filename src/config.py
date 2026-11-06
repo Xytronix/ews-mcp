@@ -1,8 +1,49 @@
 """Configuration management for EWS MCP Server."""
 
+import re
+
+import exchangelib.version as _exchangelib_versions
+from exchangelib import Build, Version
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 from typing import Callable, Literal, Optional
+
+
+#: Exchange product names EWS_VERSION accepts ("2016", "2013_SP1", "O365"),
+#: read from exchangelib so a release it learns about needs no code change.
+EWS_PRODUCT_BUILDS = {
+    name[len("EXCHANGE_"):]: getattr(_exchangelib_versions, name)
+    for name in dir(_exchangelib_versions)
+    if name.startswith("EXCHANGE_")
+}
+
+
+def parse_ews_version(value: Optional[str]) -> Optional[Version]:
+    """Turn EWS_VERSION into an exchangelib Version; None means detect it.
+
+    Accepts "auto" (or empty), an Exchange product name such as "2016",
+    "Exchange2019", "2013 SP1" or "O365", or a build number such as "15.1"
+    or "15.1.1779.4".
+    """
+    text = (value or "").strip()
+    if not text or text.lower() == "auto":
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+){1,3}", text):
+        numbers = [int(part) for part in text.split(".")]
+        build = Build(*(numbers + [0, 0])[:4])
+    else:
+        key = re.sub(r"[\s_-]+", "_", text.upper()).replace("EXCHANGE", "").strip("_")
+        build = EWS_PRODUCT_BUILDS.get(key)
+    if build is None:
+        raise ValueError(
+            f"EWS_VERSION={value!r} is not 'auto', an Exchange product "
+            f"({', '.join(sorted(EWS_PRODUCT_BUILDS))}) or a build number "
+            "such as 15.1.1779.4"
+        )
+    try:
+        return Version(build=build)
+    except Exception as exc:  # exchangelib has no API version for that build
+        raise ValueError(f"EWS_VERSION={value!r}: no EWS API version is known for build {build}") from exc
 
 
 def _make_int_clamp(logger) -> Callable[..., int]:
@@ -59,6 +100,11 @@ class Settings(BaseSettings):
     ews_server_url: Optional[str] = None
     ews_email: str
     ews_autodiscover: bool = True
+    # EWS schema version. "auto" detects it from the server once and reuses
+    # the answer for every mailbox on the same EWS_SERVER_URL. Pin it (for
+    # example "2016" or "15.1.1779.4") when detection is slow or throttled,
+    # as on hosted SmarterMail, or when the server reports the wrong version.
+    ews_version: str = "auto"
 
     # Authentication
     ews_auth_type: Literal["oauth2", "basic", "ntlm"] = "oauth2"
@@ -243,6 +289,13 @@ class Settings(BaseSettings):
     enable_email_classification: bool = False
     enable_smart_replies: bool = False
     enable_email_summarization: bool = False
+
+    @field_validator("ews_version")
+    @classmethod
+    def check_ews_version(cls, value: str) -> str:
+        """Fail at startup, naming the accepted forms, on an unknown version."""
+        parse_ews_version(value)
+        return value
 
     @model_validator(mode='after')
     def validate_auth_credentials(self) -> 'Settings':
